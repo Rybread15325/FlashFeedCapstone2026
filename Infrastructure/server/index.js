@@ -7,6 +7,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { connectDB } from './db.js'
 import Redis from 'ioredis'
+import * as diskdb from './diskdb.js'   // hard-disk (on-disk SQLite) news store + retention sweeper
 
 import articlesRouter    from './routes/articles.js'
 import screenerRouter    from './routes/screener.js'
@@ -2751,8 +2752,10 @@ function yahooIntervalFor(interval) {
   return "1d"
 }
 
-async function fetchYahooCandles(ticker, range, interval) {
-  const yahooRange = yahooRangeFor(range, interval)
+async function fetchYahooCandles(ticker, range, interval, opts = {}) {
+  // raw:true passes the given range straight through (used by the multi-timeframe
+  // tf= selector, which needs longer history than the default range caps allow).
+  const yahooRange = opts.raw ? String(range || "1mo") : yahooRangeFor(range, interval)
   const yahooInterval = yahooIntervalFor(interval)
   const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}`)
   url.searchParams.set("range", yahooRange)
@@ -3068,6 +3071,40 @@ async function chartSocialSeries(db, ticker, windowMinutes, bucketMinutes) {
   }), bucketMinutes)
 }
 
+// Full multi-timeframe selector → (Yahoo fetch range, base interval, resample-to
+// minutes). Odd buckets (3m/10m/2h/5h/12h/2d) are resampled from a finer base on
+// the server so the candlestick + RSI + MACD all line up. raw fetch is used so the
+// longer histories aren't clipped by the default range caps.
+const CHART_TF_MAP = {
+  "1m":  { range: "1d",  interval: "1m",  resample: 0 },
+  "3m":  { range: "5d",  interval: "1m",  resample: 3 },
+  "5m":  { range: "5d",  interval: "5m",  resample: 0 },
+  "10m": { range: "1mo", interval: "5m",  resample: 10 },
+  "15m": { range: "1mo", interval: "15m", resample: 0 },
+  "30m": { range: "1mo", interval: "30m", resample: 0 },
+  "1h":  { range: "6mo", interval: "1h",  resample: 0 },
+  "2h":  { range: "1y",  interval: "1h",  resample: 120 },
+  "5h":  { range: "1y",  interval: "1h",  resample: 300 },
+  "12h": { range: "1y",  interval: "1h",  resample: 720 },
+  "1d":  { range: "2y",  interval: "1d",  resample: 0 },
+  "2d":  { range: "5y",  interval: "1d",  resample: 2880 },
+  "1w":  { range: "5y",  interval: "1wk", resample: 0 },
+}
+function resampleCandlesByMinutes(candles, minutes) {
+  if (!minutes || minutes <= 0 || !candles.length) return candles
+  const sizeSec = minutes * 60
+  const buckets = new Map()
+  for (const c of candles) {
+    const t = Number(c.time)
+    if (!Number.isFinite(t)) continue
+    const bStart = Math.floor(t / sizeSec) * sizeSec
+    const b = buckets.get(bStart)
+    if (!b) buckets.set(bStart, { time: bStart, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 })
+    else { b.high = Math.max(b.high, c.high); b.low = Math.min(b.low, c.low); b.close = c.close; b.volume += c.volume || 0 }
+  }
+  return [...buckets.values()].sort((a, b) => a.time - b.time)
+}
+
 app.get("/api/charts/:ticker", async (req, res) => {
   try {
     const db = mongoose.connection.db
@@ -3076,8 +3113,23 @@ app.get("/api/charts/:ticker", async (req, res) => {
     const ticker = normalizeTickerList([req.params.ticker], 1, { ensurePrivate: false })[0] || ""
     if (!ticker) return res.status(400).json({ ok: false, candles: [], error: "ticker is required" })
 
-    const range = String(req.query.range || "3mo")
-    const interval = yahooIntervalFor(req.query.interval || "1d")
+    // Three ways to ask for candles, in priority order:
+    //   1. tf= (1m,3m,5m,10m,15m,30m,1h,2h,5h,12h,1d,2d,1w) — the full multi-timeframe
+    //      selector; server fetches the right history and resamples odd buckets.
+    //   2. window= (full/2h/1h) — Aman's intraday 1-min views + density/sentiment overlays.
+    //   3. range=&interval= — the original FlashFeed contract (back-compat).
+    const tfParam = String(req.query.tf || "").toLowerCase()
+    const tfDef = CHART_TF_MAP[tfParam]
+    const windowParam = String(req.query.window || "").toLowerCase()
+    const intradayWindow = !tfDef && ["full", "2h", "1h"].includes(windowParam)
+    let range, interval, resampleMin = 0, rawFetch = false
+    if (tfDef) {
+      range = tfDef.range; interval = tfDef.interval; resampleMin = tfDef.resample; rawFetch = true
+    } else if (intradayWindow) {
+      range = "1d"; interval = "1m"
+    } else {
+      range = String(req.query.range || "3mo"); interval = yahooIntervalFor(req.query.interval || "1d")
+    }
     const isMinute = interval.endsWith("m")
     const socialWindow = Math.max(60, Math.min(4320, Number(req.query.window_minutes || (isMinute ? 1440 : 4320))))
     const socialBucket = Math.max(1, Math.min(60, Number(req.query.bucket_minutes || (interval === "1m" ? 1 : 5))))
@@ -3086,29 +3138,54 @@ app.get("/api/charts/:ticker", async (req, res) => {
     let priceStatus = "unavailable"
     let priceDetail = ""
     try {
-      candleResult = await fetchYahooCandles(ticker, range, interval)
+      candleResult = await fetchYahooCandles(ticker, range, interval, { raw: rawFetch })
       priceStatus = candleResult.candles.length ? "working" : "no_bars_returned"
     } catch (err) {
       priceDetail = String(err.message || err)
     }
 
-    const [socialRows, newsEvents, predictionEvents] = await Promise.all([
-      chartSocialSeries(db, ticker, socialWindow, socialBucket),
-      chartNewsEvents(db, ticker, socialWindow),
-      chartPredictionEvents(db, ticker, socialWindow),
-    ])
-    const candles = candleResult.candles
+    // The multi-timeframe (tf=) path only needs OHLC + indicators — the swapped-in
+    // charts fetch social separately. So skip the 3 social/news/prediction DB queries
+    // on that path; legacy window=/range= consumers still get the full event series.
+    let socialRows = [], newsEvents = [], predictionEvents = []
+    if (!tfDef) {
+      ;[socialRows, newsEvents, predictionEvents] = await Promise.all([
+        chartSocialSeries(db, ticker, socialWindow, socialBucket),
+        chartNewsEvents(db, ticker, socialWindow),
+        chartPredictionEvents(db, ticker, socialWindow),
+      ])
+    }
+    let candles = candleResult.candles
+    if (resampleMin > 0) candles = resampleCandlesByMinutes(candles, resampleMin)
+    // Optional intraday window slice (Aman's Last-2h / Last-1h controls).
+    let viewCandles = candles
+    if (intradayWindow && (windowParam === "2h" || windowParam === "1h") && candles.length) {
+      const lastTime = Number(candles[candles.length - 1].time || 0)
+      const spanSec = (windowParam === "2h" ? 2 : 1) * 3600
+      viewCandles = candles.filter(c => Number(c.time || 0) >= lastTime - spanSec)
+    }
+    // Session date (YYYY-MM-DD, ET) used by Aman's charts header + research views.
+    let sessionDate = ""
+    try {
+      const lastSec = Number((viewCandles[viewCandles.length - 1] || candles[candles.length - 1] || {}).time || 0)
+      const d = lastSec ? new Date(lastSec * 1000) : new Date()
+      sessionDate = new Intl.DateTimeFormat("en-CA", { timeZone: MARKET_WINDOW_TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(d)
+    } catch (_) { sessionDate = new Date().toISOString().slice(0, 10) }
     const chartEvents = [...newsEvents, ...chartSocialEvents(socialRows), ...predictionEvents].sort((a, b) => Number(a.time || 0) - Number(b.time || 0))
     res.json({
       ok: true,
       ticker,
       range,
       interval,
-      candles,
-      bollinger: candles.length >= 20 ? bollinger(candles) : { upper: [], lower: [] },
-      rsi: candles.length >= 15 ? rsi(candles) : [],
-      macd: macd(candles),
-      predicted: predictedPriceSeries(candles),
+      tf: tfParam || undefined,
+      window: windowParam || undefined,
+      date: sessionDate,
+      n: viewCandles.length,
+      candles: viewCandles,
+      bollinger: viewCandles.length >= 20 ? bollinger(viewCandles) : { upper: [], lower: [] },
+      rsi: viewCandles.length >= 15 ? rsi(viewCandles) : [],
+      macd: macd(viewCandles),
+      predicted: predictedPriceSeries(viewCandles),
       news_events: chartEvents,
       structured_news_events: newsEvents,
       social_events: chartEvents.filter(event => event.event_type === "social_spike"),
@@ -3132,6 +3209,197 @@ app.get("/api/charts/:ticker", async (req, res) => {
   } catch (err) {
     console.error("GET /api/charts/:ticker failed:", err)
     res.status(500).json({ ok: false, candles: [], error: String(err.message || err) })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Chart-support endpoints for the swapped-in Aman charts
+//  (candlestick + research views + per-ticker enrich panel + grid sparklines).
+//  All are additive and reuse FlashFeed's existing chart/social helpers.
+// ─────────────────────────────────────────────────────────────────────────────
+function etHHMM(sec) {
+  const n = Number(sec || 0)
+  if (!n) return ""
+  try {
+    return new Intl.DateTimeFormat("en-GB", { timeZone: MARKET_WINDOW_TIME_ZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(n * 1000))
+  } catch (_) { return "" }
+}
+function etDate(sec) {
+  const d = sec ? new Date(Number(sec) * 1000) : new Date()
+  try { return new Intl.DateTimeFormat("en-CA", { timeZone: MARKET_WINDOW_TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(d) }
+  catch (_) { return new Date().toISOString().slice(0, 10) }
+}
+
+// GET /api/chart — intraday price series for the research views (ResearchChart).
+app.get("/api/chart", async (req, res) => {
+  try {
+    const ticker = normalizeTickerList([req.query.ticker], 1, { ensurePrivate: false })[0] || ""
+    if (!ticker) return res.status(400).json({ error: "ticker is required" })
+    const windowParam = String(req.query.window || "full").toLowerCase()
+    let cr = { candles: [] }
+    try { cr = await fetchYahooCandles(ticker, "1d", "1m") } catch (_) {}
+    let candles = cr.candles || []
+    if ((windowParam === "2h" || windowParam === "1h") && candles.length) {
+      const lastTime = Number(candles[candles.length - 1].time || 0)
+      const spanSec = (windowParam === "2h" ? 2 : 1) * 3600
+      candles = candles.filter(c => Number(c.time || 0) >= lastTime - spanSec)
+    }
+    const date = etDate(Number((candles[candles.length - 1] || {}).time || 0))
+    res.json({
+      ticker, date,
+      labels: candles.map(c => etHHMM(c.time)),
+      prices: candles.map(c => Number(c.close ?? 0)),
+      volumes: candles.map(c => Number(c.volume ?? 0)),
+    })
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) })
+  }
+})
+
+// GET /api/chart/social — per-minute density + sentiment series for both the
+// candlestick overlays and the research views. Derived from FlashFeed's social
+// rolling series; returns a graceful empty payload when there is no social data.
+app.get("/api/chart/social", async (req, res) => {
+  try {
+    const db = mongoose.connection.db
+    const ticker = normalizeTickerList([req.query.ticker], 1, { ensurePrivate: false })[0] || ""
+    if (!ticker) return res.status(400).json({ error: "ticker is required" })
+    let rows = []
+    try { rows = db ? await chartSocialSeries(db, ticker, 1440, 1) : [] } catch (_) { rows = [] }
+    if (!rows.length) {
+      return res.json({
+        status: "ok", source: "none", messages: 0, bullish: 0, bearish: 0, complete: true,
+        labels: [], density: [], density_smooth: [], sent_labels: [], scores: [], scores_smooth: [],
+        win_density: [], win_density_smooth: [],
+      })
+    }
+    const labels = rows.map(r => etHHMM(r.time))
+    const density = rows.map(r => Number(r.message_density ?? 0))
+    const scores = rows.map(r => Number(r.sentiment ?? 0))
+    const messages = rows.reduce((a, r) => a + Number(r.message_count ?? 0), 0)
+    const bullish = rows.reduce((a, r) => a + (Number(r.sentiment ?? 0) > 0.1 ? Number(r.message_count ?? 0) : 0), 0)
+    const bearish = rows.reduce((a, r) => a + (Number(r.sentiment ?? 0) < -0.1 ? Number(r.message_count ?? 0) : 0), 0)
+    res.json({
+      status: "ok", source: "feedflash-social", messages, bullish, bearish, complete: true,
+      labels, density, density_smooth: density,
+      sent_labels: labels, scores, scores_smooth: scores,
+      win_density: density, win_density_smooth: density,
+    })
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) })
+  }
+})
+
+// GET /api/ticker/:ticker/enrich — the per-ticker enrichment panel below the
+// chart: the last-3-day news feed + a social/gossip summary. Pure DB reads.
+app.get("/api/ticker/:ticker/enrich", async (req, res) => {
+  const ticker = normalizeTickerList([req.params.ticker], 1, { ensurePrivate: false })[0] || ""
+  const ENRICH_DAYS = 3
+  const empty = {
+    ticker, news_alert: false, news_alert_count: 0,
+    news: { days: ENRICH_DAYS, articles: [], ai: null, sources: [], source_filter_active: false, note: "Last 3 days · FlashFeed structured news" },
+    social: { stocktwits: null, bluesky: { configured: false, metrics: null }, reddit: { configured: false, metrics: null }, rumor: null, future_sources: ["X"] },
+  }
+  try {
+    const db = mongoose.connection.db
+    if (!db || !ticker) return res.json(empty)
+    const cutoff = new Date(Date.now() - ENRICH_DAYS * 86_400_000)
+    const tickerRe = new RegExp(`(^|,)\\s*${ticker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*(,|$)`, "i")
+    let docs = []
+    try {
+      docs = await db.collection("articles").find(
+        { $and: [{ $or: [{ ticker }, { ticker: tickerRe }] }, { publish_date: { $gte: cutoff } }] },
+        { projection: { title: 1, source: 1, url: 1, publish_date: 1, fetched_date: 1, sentiment: 1, ml_confidence: 1 } },
+      ).sort({ publish_date: -1 }).limit(40).toArray()
+    } catch (_) { docs = [] }
+    const articles = docs.map((d, i) => {
+      const when = d.publish_date || d.fetched_date
+      const sec = when ? Math.floor(new Date(when).getTime() / 1000) : null
+      const score = (d.sentiment === "bullish" ? (d.ml_confidence ?? 0.5) : d.sentiment === "bearish" ? -(d.ml_confidence ?? 0.5) : 0)
+      return {
+        id: String(d._id || `a-${i}`),
+        headline: d.title || "(untitled)",
+        source: d.source || "unknown",
+        url: d.url && d.url !== "#" ? d.url : null,
+        published_at: sec,
+        sentiment: d.sentiment || "neutral",
+        sentiment_score: Number(score.toFixed(2)),
+      }
+    })
+    const sources = [...new Set(articles.map(a => a.source))].slice(0, 12)
+
+    // Lightweight social summary from the rolling social series (StockTwits).
+    let stocktwits = null
+    try {
+      const rows = await chartSocialSeries(db, ticker, 72 * 60, 5)
+      if (rows && rows.length) {
+        const msgs = rows.reduce((a, r) => a + Number(r.message_count ?? 0), 0)
+        const sVals = rows.map(r => Number(r.sentiment ?? 0)).filter(n => Number.isFinite(n))
+        const avg = sVals.length ? sVals.reduce((a, b) => a + b, 0) / sVals.length : null
+        const bull = rows.reduce((a, r) => a + (Number(r.sentiment ?? 0) > 0.1 ? Number(r.message_count ?? 0) : 0), 0)
+        const bear = rows.reduce((a, r) => a + (Number(r.sentiment ?? 0) < -0.1 ? Number(r.message_count ?? 0) : 0), 0)
+        if (msgs > 0) stocktwits = { sentiment: avg == null ? null : Number(avg.toFixed(2)), density: msgs, bull, bear, window_hours: 72 }
+      }
+    } catch (_) {}
+
+    res.json({
+      ticker,
+      news_alert: articles.length > 0,
+      news_alert_count: articles.length,
+      news: { days: ENRICH_DAYS, articles, ai: null, sources, source_filter_active: false, note: "Last 3 days · FlashFeed structured news" },
+      social: { stocktwits, bluesky: { configured: false, metrics: null }, reddit: { configured: false, metrics: null }, rumor: null, future_sources: ["X"] },
+    })
+  } catch (err) {
+    console.error("GET /api/ticker/:ticker/enrich failed:", err.message)
+    res.json(empty)
+  }
+})
+
+// GET /api/charts/grid-image/:ticker — server-rendered SVG sparkline for the
+// Charts Grid (Aman's grid used Python PNGs; this is a pure-Node SVG so it needs
+// no native canvas). Green/red by net change, white background to match the grid.
+const GRID_TF_MAP = {
+  "1m": ["1d", "1m"], "3m": ["5d", "5m"], "5m": ["5d", "5m"], "15m": ["1mo", "15m"],
+  "1h": ["1mo", "1h"], "d": ["6mo", "1d"], "w": ["1y", "1wk"],
+}
+app.get("/api/charts/grid-image/:ticker", async (req, res) => {
+  const W = 320, H = 132, PAD = 6
+  const placeholder = (msg) =>
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">` +
+    `<rect width="${W}" height="${H}" fill="#ffffff"/>` +
+    `<text x="${W / 2}" y="${H / 2}" fill="#94a3b8" font-family="monospace" font-size="12" text-anchor="middle">${msg}</text></svg>`
+  res.set("Content-Type", "image/svg+xml")
+  res.set("Cache-Control", "public, max-age=45")
+  try {
+    const ticker = normalizeTickerList([req.params.ticker], 1, { ensurePrivate: false })[0] || ""
+    if (!ticker) return res.send(placeholder("no ticker"))
+    const tf = String(req.query.tf || "5m").toLowerCase()
+    const [range, interval] = GRID_TF_MAP[tf] || GRID_TF_MAP["5m"]
+    let cr = { candles: [] }
+    try { cr = await fetchYahooCandles(ticker, range, interval) } catch (_) {}
+    const closes = (cr.candles || []).map(c => Number(c.close ?? 0)).filter(Number.isFinite)
+    if (closes.length < 2) return res.send(placeholder(`${ticker} · no data`))
+    const lo = Math.min(...closes), hi = Math.max(...closes), span = (hi - lo) || 1
+    const up = closes[closes.length - 1] >= closes[0]
+    const stroke = up ? "#10b981" : "#ef4444"
+    const fill = up ? "rgba(16,185,129,0.12)" : "rgba(239,68,68,0.12)"
+    const x = (i) => PAD + (i / (closes.length - 1)) * (W - 2 * PAD)
+    const y = (v) => PAD + (1 - (v - lo) / span) * (H - 2 * PAD - 14)
+    const pts = closes.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ")
+    const area = `${PAD},${(H - PAD - 14).toFixed(1)} ${pts} ${(W - PAD).toFixed(1)},${(H - PAD - 14).toFixed(1)}`
+    const last = closes[closes.length - 1]
+    const pct = (((last - closes[0]) / (closes[0] || 1)) * 100)
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">` +
+      `<rect width="${W}" height="${H}" fill="#ffffff"/>` +
+      `<polygon points="${area}" fill="${fill}" stroke="none"/>` +
+      `<polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="1.6"/>` +
+      `<text x="${PAD}" y="${H - 4}" fill="#475569" font-family="monospace" font-size="11">${ticker} ${tf}</text>` +
+      `<text x="${W - PAD}" y="${H - 4}" fill="${stroke}" font-family="monospace" font-size="11" text-anchor="end">$${last.toFixed(2)} ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%</text>` +
+      `</svg>`
+    return res.send(svg)
+  } catch (err) {
+    return res.send(placeholder("chart error"))
   }
 })
 
@@ -4050,6 +4318,10 @@ async function ensureRuntimeIndexes() {
 async function start() {
   await connectDB()
   await ensureRuntimeIndexes()
+
+  // Shared guard so the heavy data-refresh cycle never runs twice at once
+  // (double Run Now clicks, or Run Now firing while the auto-grabber is mid-cycle).
+  let refreshCycleInFlight = false
   
 // Ryan frontend compatibility endpoints
 app.get("/api/status", async (req, res) => {
@@ -4457,95 +4729,80 @@ async function runDataRefreshCycle(db, { socialMode = "top_momentum", mode = "fa
     SOCIAL_REDDIT_PUBLIC_FALLBACK: process.env.SOCIAL_REDDIT_PUBLIC_FALLBACK || "false",
   }
 
-  const [finvizElite, tradingViewScreener] = await Promise.all([
+  // Pre-load ticker lists first (fast DB queries), then fire ALL scripts in one parallel batch.
+  const [trackedMarketTickers, publicSocialTickersRaw] = await Promise.all([
+    fastMode ? Promise.resolve([]) : loadTrackedMarketTickerSymbols(db, Number(process.env.TRACKED_MARKET_TICKER_LIMIT || 5000)),
+    socialMode === "top_momentum"
+      ? loadTopMomentumTickerSymbols(db, Number(process.env.SOCIAL_MOMENTUM_LIMIT || (fastMode ? 12 : 10)))
+      : Promise.resolve([]),
+  ])
+
+  let publicSocialTickers = publicSocialTickersRaw
+  let socialTickers = []
+  if (socialMode === "top_momentum" && publicSocialTickers.length) {
+    socialTickers = withPrivateSocialTickers(publicSocialTickers)
+    socialExtraEnv.SOCIAL_TICKERS = socialTickers.join(",")
+    socialExtraEnv.SOCIAL_MAX_TICKERS = String(socialTickers.length)
+    socialExtraEnv.SOCIAL_PRIVATE_TICKERS = Array.from(PRIVATE_TRACKED_TICKERS).join(",")
+    socialExtraEnv.SOCIAL_TICKER_SOURCE = "configured"
+  } else if (socialMode !== "top_momentum") {
+    socialExtraEnv.SOCIAL_TICKER_SOURCE = "configured"
+    socialExtraEnv.SOCIAL_MAX_TICKERS = process.env.SOCIAL_MAX_TICKERS || "250"
+  } else {
+    socialExtraEnv.SOCIAL_MAX_TICKERS = "10"
+  }
+
+  const tradingViewExtraEnv = publicSocialTickers.length
+    ? { TRADINGVIEW_TICKERS: publicSocialTickers.join(","), TRADINGVIEW_MAX_TICKERS: String(publicSocialTickers.length) }
+    : {}
+  const quoteTickers = fastMode ? publicSocialTickers : trackedMarketTickers
+  const quoteExtraEnv = quoteTickers.length
+    ? { QUOTE_TICKERS: quoteTickers.join(","), QUOTE_MAX_TICKERS: String(quoteTickers.length) }
+    : { QUOTE_MAX_TICKERS: fastMode ? "25" : (process.env.QUOTE_MAX_TICKERS || "5000") }
+
+  // All scripts run in one parallel batch — cuts total time from ~60s to ~30s
+  const [finvizElite, tradingViewScreener, quotes, structured, tradingView, benzinga, ibkrNews, schwabSignals, unstructured, social] = await Promise.all([
     runPythonScript("2_Screener/pipeline/fetch_finviz_elite_to_mongo.py", {
-      timeout: fastMode ? 30000 : 90000,
-      extraEnv: {
-        FINVIZ_MAX_WORKERS: process.env.FINVIZ_MAX_WORKERS || (fastMode ? "10" : "6"),
-      },
+      timeout: fastMode ? 25000 : 90000,
+      extraEnv: { FINVIZ_MAX_WORKERS: process.env.FINVIZ_MAX_WORKERS || (fastMode ? "12" : "6") },
     }),
     fastMode
       ? Promise.resolve(skippedPythonResult("TradingView numeric screener"))
-      : runPythonScript("2_Screener/pipeline/fetch_tradingview_screener_to_mongo.py", {
-        timeout: 90000,
-      }),
-  ])
-
-  const trackedMarketTickers = fastMode
-    ? []
-    : await loadTrackedMarketTickerSymbols(db, Number(process.env.TRACKED_MARKET_TICKER_LIMIT || 5000))
-  let socialTickers = []
-  let publicSocialTickers = []
-  if (socialMode === "top_momentum") {
-    publicSocialTickers = await loadTopMomentumTickerSymbols(db, Number(process.env.SOCIAL_MOMENTUM_LIMIT || (fastMode ? 12 : 10)))
-    socialTickers = withPrivateSocialTickers(publicSocialTickers)
-    if (socialTickers.length) {
-      socialExtraEnv.SOCIAL_TICKERS = socialTickers.join(",")
-      socialExtraEnv.SOCIAL_MAX_TICKERS = String(socialTickers.length)
-      socialExtraEnv.SOCIAL_PRIVATE_TICKERS = Array.from(PRIVATE_TRACKED_TICKERS).join(",")
-      socialExtraEnv.SOCIAL_TICKER_SOURCE = "configured"
-    } else {
-      socialExtraEnv.SOCIAL_MAX_TICKERS = "10"
-    }
-  } else {
-    socialExtraEnv.SOCIAL_TICKER_SOURCE = "configured"
-    socialExtraEnv.SOCIAL_MAX_TICKERS = process.env.SOCIAL_MAX_TICKERS || "250"
-  }
-
-  const tradingViewExtraEnv = {}
-  if (publicSocialTickers.length) {
-    tradingViewExtraEnv.TRADINGVIEW_TICKERS = publicSocialTickers.join(",")
-    tradingViewExtraEnv.TRADINGVIEW_MAX_TICKERS = String(publicSocialTickers.length)
-  }
-  const quoteTickers = fastMode ? publicSocialTickers : trackedMarketTickers
-  const quoteExtraEnv = quoteTickers.length
-    ? {
-      QUOTE_TICKERS: quoteTickers.join(","),
-      QUOTE_MAX_TICKERS: String(quoteTickers.length),
-    }
-    : { QUOTE_MAX_TICKERS: fastMode ? "25" : (process.env.QUOTE_MAX_TICKERS || "5000") }
-
-  const [quotes, structured, tradingView, benzinga, ibkrNews, schwabSignals, unstructured, social] = await Promise.all([
+      : runPythonScript("2_Screener/pipeline/fetch_tradingview_screener_to_mongo.py", { timeout: 90000 }),
     runPythonScript("1_News/pipeline/fetch_quotes_to_mongo.py", {
-      timeout: fastMode ? 25000 : 90000,
+      timeout: fastMode ? 20000 : 90000,
       extraEnv: quoteExtraEnv,
     }),
     runPythonScript("1_News/pipeline/fetch_rss_to_mongo.py", {
-      timeout: fastMode ? 25000 : 180000,
+      timeout: fastMode ? 22000 : 180000,
       extraEnv: fastMode
-        ? { RSS_FAST_MODE: "1", RSS_MAX_WORKERS: process.env.RSS_MAX_WORKERS || "24", RSS_HTTP_TIMEOUT: process.env.RSS_HTTP_TIMEOUT || "7" }
+        ? { RSS_FAST_MODE: "1", RSS_MAX_WORKERS: process.env.RSS_MAX_WORKERS || "32", RSS_HTTP_TIMEOUT: process.env.RSS_HTTP_TIMEOUT || "5" }
         : { RSS_MAX_WORKERS: process.env.RSS_MAX_WORKERS || "16" },
     }),
     runPythonScript("1_News/pipeline/fetch_tradingview_to_mongo.py", {
-      timeout: fastMode ? 30000 : 90000,
+      timeout: fastMode ? 20000 : 90000,
       extraEnv: tradingViewExtraEnv,
     }),
     fastMode && !process.env.BENZINGA_API_KEY
       ? Promise.resolve(skippedPythonResult("Benzinga", "no API key and fast mode"))
-      : runPythonScript("1_News/pipeline/fetch_benzinga_to_mongo.py", {
-        timeout: fastMode ? 30000 : 90000,
-      }),
+      : runPythonScript("1_News/pipeline/fetch_benzinga_to_mongo.py", { timeout: fastMode ? 25000 : 90000 }),
     fastMode
       ? Promise.resolve(skippedPythonResult("IBKR News"))
-      : runPythonScript("1_News/pipeline/fetch_ibkr_news_to_mongo.py", {
-        timeout: 30000,
-      }),
+      : runPythonScript("1_News/pipeline/fetch_ibkr_news_to_mongo.py", { timeout: 30000 }),
     fastMode
       ? Promise.resolve(skippedPythonResult("Schwab signals"))
-      : runPythonScript("2_Screener/pipeline/fetch_schwab_signals_to_mongo.py", {
-        timeout: 30000,
-      }),
+      : runPythonScript("2_Screener/pipeline/fetch_schwab_signals_to_mongo.py", { timeout: 30000 }),
     fastMode
       ? Promise.resolve(skippedPythonResult("Unstructured public source sweep"))
       : runPythonScript("1_News/pipeline/fetch_unstructured_news_titles_to_mongo.py", {
-        timeout: 90000,
-        extraEnv: {
-          UNSTRUCTURED_MAX_PER_SOURCE: process.env.UNSTRUCTURED_MAX_PER_SOURCE || "10",
-          ...(trackedMarketTickers.length ? { TRACKED_TICKERS: trackedMarketTickers.join(",") } : {}),
-        },
-      }),
+          timeout: 90000,
+          extraEnv: {
+            UNSTRUCTURED_MAX_PER_SOURCE: process.env.UNSTRUCTURED_MAX_PER_SOURCE || "10",
+            ...(trackedMarketTickers.length ? { TRACKED_TICKERS: trackedMarketTickers.join(",") } : {}),
+          },
+        }),
     runPythonScript("1_News/pipeline/fetch_social_to_mongo.py", {
-      timeout: fastMode ? 25000 : 90000,
+      timeout: fastMode ? 20000 : 90000,
       extraEnv: socialExtraEnv,
     }),
   ])
@@ -4648,6 +4905,12 @@ async function runDataRefreshCycle(db, { socialMode = "top_momentum", mode = "fa
 app.post("/api/fetch", async (req, res) => {
   const started = Date.now()
 
+  // Skip duplicate/overlapping cycles instead of stacking expensive work.
+  if (refreshCycleInFlight) {
+    return res.json({ ok: true, skipped: true, already_running: true, new_articles: 0, updated_articles: 0,
+      ms: Date.now() - started, message: "A refresh is already in progress — skipped the duplicate." })
+  }
+
   try {
     const db = mongoose.connection.db
     if (!db) {
@@ -4659,9 +4922,11 @@ app.post("/api/fetch", async (req, res) => {
       })
     }
 
+    refreshCycleInFlight = true
     const result = await runDataRefreshCycle(db, {
       mode: req.query.mode || req.body?.mode || process.env.DEFAULT_FETCH_MODE || "fast",
     })
+    persistFetchNewsToDisk(db).catch(() => {})   // Redis+Kafka fetch → hard disk (3d)
     return res.json({
       ...result,
       ms: Date.now() - started,
@@ -4679,6 +4944,8 @@ app.post("/api/fetch", async (req, res) => {
       stdout: String(err?.stdout || "").slice(-3000),
       stderr: String(err?.stderr || "").slice(-3000),
     })
+  } finally {
+    refreshCycleInFlight = false
   }
 })
 // NEWS_RSS_FETCH_API_V3_END
@@ -4696,8 +4963,9 @@ app.get("/api/watch", async (req, res) => {
   let isRunning = false;
 
   const runFetchCycle = async () => {
-    if (isRunning) return; // Prevent overlapping cycles
+    if (isRunning || refreshCycleInFlight) return; // don't overlap with Run Now or another cycle
     isRunning = true;
+    refreshCycleInFlight = true;
     
     const cycleStarted = Date.now();
     try {
@@ -4706,6 +4974,7 @@ app.get("/api/watch", async (req, res) => {
         socialMode: "top_momentum",
         mode: req.query.mode || "fast",
       })
+      persistFetchNewsToDisk(db).catch(() => {})   // auto-watch fetch → hard disk (3d)
       const newCount = Number(result.new_articles || 0) + Number(result.unstructured_new || 0)
       const updatedCount = Number(result.updated_articles || 0) + Number(result.unstructured_updated || 0)
       const tradingViewNew = Number(result.tradingview_new || 0)
@@ -4740,6 +5009,7 @@ app.get("/api/watch", async (req, res) => {
       res.write(`data: ${JSON.stringify({ message: `Auto-watch cycle failed: ${err.message}` })}\n\n`);
     } finally {
       isRunning = false;
+      refreshCycleInFlight = false;
     }
   };
 
@@ -5108,15 +5378,18 @@ async function countArticlesForSourceLabel(label) {
 
 app.get("/api/settings/sources", async (req, res) => {
   try {
-    const custom = await settingsDb().collection("rss_sources")
-      .find({})
-      .sort({ enabled: -1, name: 1 })
-      .toArray();
+    const db = settingsDb()
+    const [custom, favDocs] = await Promise.all([
+      db.collection("rss_sources").find({}).sort({ enabled: -1, name: 1 }).toArray(),
+      db.collection("source_favorites").find({}).toArray(),
+    ])
+    const favSet = new Set(favDocs.map(f => f.name))
 
     const structured = [];
     for (const s of PROFESSOR_STRUCTURED_SOURCES) {
       structured.push({
         ...s,
+        is_favorite: favSet.has(s.source),
         count: await countArticlesForSourceLabel(s.source)
       });
     }
@@ -5124,6 +5397,7 @@ app.get("/api/settings/sources", async (req, res) => {
     res.json({
       ok: true,
       structured,
+      favorites: Array.from(favSet),
       custom_rss_sources: custom.map(s => ({
         id: String(s._id),
         name: s.name,
@@ -5131,6 +5405,7 @@ app.get("/api/settings/sources", async (req, res) => {
         url: s.url,
         category: s.category || "custom",
         enabled: s.enabled !== false,
+        is_favorite: favSet.has(s.name),
         status: s.enabled === false ? "disabled" : "enabled",
         editable: true
       }))
@@ -5140,6 +5415,39 @@ app.get("/api/settings/sources", async (req, res) => {
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
+
+app.post("/api/settings/sources/:name/favorite", async (req, res) => {
+  try {
+    const name = cleanSettingText(decodeURIComponent(req.params.name))
+    await settingsDb().collection("source_favorites").updateOne(
+      { name },
+      { $set: { name, favorited_at: Math.floor(Date.now() / 1000) } },
+      { upsert: true }
+    )
+    res.json({ ok: true, name, favorited: true })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) })
+  }
+})
+
+app.delete("/api/settings/sources/:name/favorite", async (req, res) => {
+  try {
+    const name = cleanSettingText(decodeURIComponent(req.params.name))
+    await settingsDb().collection("source_favorites").deleteOne({ name })
+    res.json({ ok: true, name, favorited: false })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) })
+  }
+})
+
+app.get("/api/settings/sources/favorites", async (req, res) => {
+  try {
+    const docs = await settingsDb().collection("source_favorites").find({}).sort({ favorited_at: -1 }).toArray()
+    res.json({ ok: true, favorites: docs.map(d => d.name) })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) })
+  }
+})
 
 app.post("/api/settings/sources", async (req, res) => {
   try {
@@ -5277,6 +5585,235 @@ app.delete('/api/settings/keywords/:keyword', async (req, res) => {
     res.status(500).json({ ok: false, error: String(err.message || err) })
   }
 })
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  HARD-DISK DATABASE — on-disk persistence + retention + auto-grab
+  //  Companion to the RAM layer (Redis). See diskdb.js. Buckets:
+  //    manual (3d) · auto (2d, away-mode) · fetch (3d, Redis+Kafka path)
+  // ═══════════════════════════════════════════════════════════════════════════
+  await diskdb.init()
+  const diskFetchDays = diskdb.stats().retention_days.fetch
+  const diskAutoDays  = diskdb.stats().retention_days.auto
+
+  // Shape the latest Mongo news for the disk store.
+  async function collectRecentNewsFromMongo(db, days = 3, limit = 5000) {
+    if (!db) return []
+    // publish_date is stored as Unix seconds (integer) — compare as number, not Date
+    const cutoffSec = Math.floor((Date.now() - Math.max(1, days) * 86_400_000) / 1000)
+    const projection = { title: 1, source: 1, url: 1, publish_date: 1, fetched_date: 1, sentiment: 1, ml_confidence: 1, ticker: 1, content: 1 }
+    let docs = []
+    try {
+      docs = await db.collection('articles').find({
+        $or: [
+          { publish_date: { $gte: cutoffSec } },
+          { fetched_date: { $gte: cutoffSec } },
+        ]
+      }, { projection })
+        .sort({ publish_date: -1 }).limit(Math.max(1, Math.min(20000, limit))).toArray()
+    } catch (_) {
+      try { docs = await db.collection('articles').find({}, { projection }).sort({ _id: -1 }).limit(2000).toArray() }
+      catch (__) { docs = [] }
+    }
+    return docs.map(d => {
+      const when = d.publish_date || d.fetched_date
+      const sec = when ? Math.floor(new Date(when).getTime() / 1000) : null
+      const score = d.sentiment === 'bullish' ? (d.ml_confidence ?? 0.5) : d.sentiment === 'bearish' ? -(d.ml_confidence ?? 0.5) : 0
+      return {
+        ticker: articlePrimaryTicker(d) || String(d.ticker || '').split(',')[0] || '',
+        title: d.title || '',
+        source: d.source || '',
+        url: d.url && d.url !== '#' ? d.url : '',
+        summary: String(d.content || '').slice(0, 400),
+        sentiment: d.sentiment || 'neutral',
+        sentiment_score: Number(Number(score).toFixed(3)),
+        published_at: sec,
+      }
+    })
+  }
+
+  // Redis+Kafka fetch path → hard disk (bucket 'fetch', 3-day retention).
+  async function persistFetchNewsToDisk(db) {
+    if (!diskdb.isEnabled()) return { stored: 0 }
+    try { return diskdb.storeNews(await collectRecentNewsFromMongo(db, diskFetchDays, 5000), 'fetch') }
+    catch (e) { console.warn('persistFetchNewsToDisk error:', e.message); return { stored: 0 } }
+  }
+
+  // ── Presence: the frontend pings while open; absence ⇒ auto-grabber archives.
+  let lastPresenceAt = 0
+  const PRESENCE_TIMEOUT_MS = Number(process.env.PRESENCE_TIMEOUT_MS || 90_000)
+  const siteOpen = () => (Date.now() - lastPresenceAt) < PRESENCE_TIMEOUT_MS
+  // Reassigned below once the on-site auto-fetch is set up; the ping triggers a check.
+  let triggerOnSiteAutoFetch = () => {}
+  app.post('/api/presence/ping', (req, res) => {
+    lastPresenceAt = Date.now()
+    res.json({ ok: true, last_presence_at: lastPresenceAt, site_open: true })
+    // While someone is on the site, grab fresh news on arrival and then every interval.
+    try { triggerOnSiteAutoFetch() } catch (_) {}
+  })
+
+  // ── Disk DB REST API ───────────────────────────────────────────────────────
+  // Save the last N days of news to disk (manual button + on-exit beacon).
+  app.post('/api/disk/save-news', async (req, res) => {
+    const db = mongoose.connection.db
+    const days = Math.max(1, Math.min(30, Number(req.query.days || req.body?.days || 3)))
+    if (!diskdb.isEnabled()) return res.status(503).json({ ok: false, error: 'Hard-disk database is not available', saved: 0 })
+    try {
+      const r = diskdb.storeNews(await collectRecentNewsFromMongo(db, days, 5000), 'manual')
+      res.json({ ok: true, saved: r.stored, bucket: 'manual', days, retention_days: diskdb.stats().retention_days.manual })
+    } catch (e) { res.status(500).json({ ok: false, error: String(e.message || e), saved: 0 }) }
+  })
+
+  app.get('/api/disk/news', (req, res) => {
+    const news = diskdb.listNews({ bucket: req.query.bucket, ticker: req.query.ticker, limit: req.query.limit })
+    res.json({ ok: true, count: news.length, news })
+  })
+
+  app.get('/api/disk/stats', (req, res) => {
+    res.json({
+      ...diskdb.stats(),
+      presence: { site_open: siteOpen(), last_presence_at: lastPresenceAt || null },
+      auto_fetch: {
+        onsite_enabled: ONSITE_FETCH_ENABLED,
+        onsite_interval_min: Math.round(ONSITE_FETCH_INTERVAL_MS / 60000),
+        onsite_last_at: lastOnSiteFetchAt,
+        onsite_retention_days: diskFetchDays,
+        away_enabled: AUTO_GRAB_ENABLED,
+        away_interval_min: Math.round(AUTO_GRAB_INTERVAL_MS / 60000),
+        away_retention_days: diskAutoDays,
+      },
+    })
+  })
+
+  // ── Redis (RAM) stats ─────────────────────────────────────────────────────
+  app.get('/api/redis/stats', async (req, res) => {
+    if (!redisReady()) {
+      return res.json({ available: false, error: 'Redis not connected' })
+    }
+    try {
+      const raw = await redis.info()
+      const parse = (key) => {
+        const m = raw.match(new RegExp(`^${key}:(.+)$`, 'm'))
+        return m ? m[1].trim() : null
+      }
+      const usedMem   = Number(parse('used_memory') || 0)
+      const peakMem   = Number(parse('used_memory_peak') || 0)
+      const maxMem    = Number(parse('maxmemory') || 0)
+      const keyspaceHits   = Number(parse('keyspace_hits') || 0)
+      const keyspaceMisses = Number(parse('keyspace_misses') || 0)
+      const totalCmds = Number(parse('total_commands_processed') || 0)
+      const hitRate   = (keyspaceHits + keyspaceMisses) > 0
+        ? Math.round(keyspaceHits / (keyspaceHits + keyspaceMisses) * 100)
+        : null
+      // Count total keys across all DBs
+      const dbSection = raw.match(/^db\d+:keys=(\d+)/mg) || []
+      const totalKeys = dbSection.reduce((s, l) => s + Number(l.match(/keys=(\d+)/)[1]), 0)
+      const uptimeSecs = Number(parse('uptime_in_seconds') || 0)
+      res.json({
+        available: true,
+        mode: 'RAM-only (no disk persistence)',
+        policy: parse('maxmemory_policy') || 'allkeys-lru',
+        used_memory_bytes: usedMem,
+        peak_memory_bytes: peakMem,
+        max_memory_bytes: maxMem,
+        used_pct: maxMem > 0 ? Math.round(usedMem / maxMem * 100) : null,
+        total_keys: totalKeys,
+        keyspace_hits: keyspaceHits,
+        keyspace_misses: keyspaceMisses,
+        hit_rate_pct: hitRate,
+        total_commands: totalCmds,
+        uptime_seconds: uptimeSecs,
+        version: parse('redis_version'),
+        connected_clients: Number(parse('connected_clients') || 0),
+      })
+    } catch (e) {
+      res.json({ available: false, error: e.message })
+    }
+  })
+
+  // Download saved news as a real local JSON file ("locally save").
+  app.get('/api/disk/export', (req, res) => {
+    const days = Math.max(1, Math.min(30, Number(req.query.days || 3)))
+    const bucket = req.query.bucket || null
+    const rows = diskdb.recentForExport(days, bucket)
+    const stamp = new Date().toISOString().slice(0, 10)
+    res.set('Content-Type', 'application/json')
+    res.set('Content-Disposition', `attachment; filename="flashfeed-news-${stamp}.json"`)
+    res.send(JSON.stringify({ exported_at: new Date().toISOString(), days, bucket: bucket || 'all', count: rows.length, news: rows }, null, 2))
+  })
+
+  app.post('/api/disk/sweep', (req, res) => {
+    res.json({ ok: true, deleted: diskdb.sweep(), stats: diskdb.stats() })
+  })
+
+  // ── Auto-grab background job ────────────────────────────────────────────────
+  // On the site (recent ping) → live UI handles news. Away → grab + archive to
+  // the 'auto' bucket (2-day retention, then the sweeper auto-deletes it).
+  const AUTO_GRAB_ENABLED = process.env.AUTO_GRAB_ENABLED !== 'false'
+  const AUTO_GRAB_INTERVAL_MS = Number(process.env.AUTO_GRAB_INTERVAL_MS || 5 * 60 * 1000)
+  const AUTO_GRAB_RUN_FETCH = process.env.AUTO_GRAB_RUN_FETCH !== 'false'
+  let autoGrabRunning = false
+  async function autoGrabTick() {
+    if (autoGrabRunning || siteOpen() || !diskdb.isEnabled() || refreshCycleInFlight) return
+    const db = mongoose.connection.db
+    if (!db) return
+    autoGrabRunning = true
+    try {
+      if (AUTO_GRAB_RUN_FETCH) {
+        refreshCycleInFlight = true
+        try { await runDataRefreshCycle(db, { mode: 'fast' }) }
+        catch (_) {}
+        finally { refreshCycleInFlight = false }
+      }
+      const r = diskdb.storeNews(await collectRecentNewsFromMongo(db, diskAutoDays, 3000), 'auto')
+      if (r.stored) console.log(`  AutoGrab → archived ${r.stored} news to hard disk (away mode, ${diskAutoDays}d)`)
+    } catch (e) { console.warn('autoGrabTick error:', e.message) }
+    finally { autoGrabRunning = false }
+  }
+  if (AUTO_GRAB_ENABLED && diskdb.isEnabled()) {
+    const t = setInterval(autoGrabTick, AUTO_GRAB_INTERVAL_MS)
+    if (t.unref) t.unref()
+    console.log(`  AutoGrab → enabled (every ${Math.round(AUTO_GRAB_INTERVAL_MS / 1000)}s while away → 'auto' ${diskAutoDays}d)`)
+  }
+
+  // ── On-site auto-fetch ──────────────────────────────────────────────────────
+  // While someone is USING the website (recent presence ping), automatically grab
+  // new articles every ONSITE_FETCH_INTERVAL_MS (default 20 min) and mirror them to
+  // the hard-disk 'fetch' bucket (deleted after DISK_TTL_FETCH_DAYS = 3 days).
+  //
+  // It's driven two ways so the update is responsive: (1) the presence ping triggers
+  // a check on each heartbeat, so a fresh visit grabs news right away, and (2) a
+  // lightweight timer checks once a minute as a backstop. A due-check limits the
+  // actual fetch to at most once per interval, and the shared refreshCycleInFlight
+  // guard keeps it from overlapping Run Now / Auto-watch / the away auto-grabber.
+  const ONSITE_FETCH_ENABLED = process.env.ONSITE_FETCH_ENABLED !== 'false'
+  const ONSITE_FETCH_INTERVAL_MS = Number(process.env.ONSITE_FETCH_INTERVAL_MS || 20 * 60 * 1000) // 20 min
+  const ONSITE_FETCH_CHECK_MS = Math.max(15_000, Math.min(ONSITE_FETCH_INTERVAL_MS, 60_000))      // check cadence
+  let onSiteFetchRunning = false
+  let lastOnSiteFetchAt = null
+  const onSiteFetchDue = () =>
+    ONSITE_FETCH_ENABLED && siteOpen() && (Date.now() - (lastOnSiteFetchAt || 0)) >= ONSITE_FETCH_INTERVAL_MS
+  async function onSiteAutoFetchTick() {
+    if (onSiteFetchRunning || refreshCycleInFlight) return
+    if (!onSiteFetchDue()) return                 // on-site + at most once per interval
+    const db = mongoose.connection.db
+    if (!db) return
+    onSiteFetchRunning = true
+    refreshCycleInFlight = true
+    try {
+      await runDataRefreshCycle(db, { mode: process.env.ONSITE_FETCH_MODE || 'fast' })  // grab new articles
+      persistFetchNewsToDisk(db).catch(() => {})   // → 'fetch' bucket (3-day retention, then auto-deleted)
+      lastOnSiteFetchAt = Date.now()
+      console.log(`  OnSiteAutoFetch → grabbed new articles (on-site, every ${Math.round(ONSITE_FETCH_INTERVAL_MS / 60000)} min; hard-disk 'fetch' ${diskFetchDays}d)`)
+    } catch (e) { console.warn('onSiteAutoFetchTick error:', e.message) }
+    finally { refreshCycleInFlight = false; onSiteFetchRunning = false }
+  }
+  // expose so the presence-ping handler can trigger an immediate check on each heartbeat
+  triggerOnSiteAutoFetch = () => { onSiteAutoFetchTick().catch(() => {}) }
+  if (ONSITE_FETCH_ENABLED) {
+    const t = setInterval(onSiteAutoFetchTick, ONSITE_FETCH_CHECK_MS)
+    if (t.unref) t.unref()
+    console.log(`  OnSiteAutoFetch → enabled (every ${Math.round(ONSITE_FETCH_INTERVAL_MS / 60000)} min while on-site → 'fetch' ${diskFetchDays}d)`)
+  }
 
 app.listen(PORT, () => {
     console.log()

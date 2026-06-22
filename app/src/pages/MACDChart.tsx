@@ -1,57 +1,66 @@
 'use client'
+import { useEffect, useRef } from 'react'
 
 interface MACDData {
-  macd: Array<{ time: string | number; value: number }>
-  signal: Array<{ time: string | number; value: number }>
-  histogram: Array<{ time: string | number; value: number }>
+  macd: Array<{ time: string; value: number }>
+  signal: Array<{ time: string; value: number }>
+  histogram: Array<{ time: string; value: number }>
 }
 
 interface Props { data?: MACDData }
 
-function finite(value: unknown) {
-  const n = Number(value)
-  return Number.isFinite(n) ? n : 0
-}
-
-function path(points: Array<{ x: number; y: number }>) {
-  return points.map((point, index) => `${index ? 'L' : 'M'}${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ')
-}
-
 export function MACDChart({ data }: Props) {
-  const macd = (data?.macd || []).map(row => ({ ...row, value: finite(row.value) }))
-  const signal = (data?.signal || []).map(row => ({ ...row, value: finite(row.value) }))
-  const histogram = (data?.histogram || []).map(row => ({ ...row, value: finite(row.value) }))
+  const containerRef = useRef<HTMLDivElement>(null)
+  const chartRef = useRef<any>(null)
 
-  if (!macd.length && !histogram.length) {
-    return <div className="w-full h-full flex items-center justify-center text-[11px] text-neutral">No MACD data</div>
-  }
+  useEffect(() => {
+    if (!containerRef.current || !data || data.macd.length === 0) return
 
-  const width = 1000
-  const height = 120
-  const pad = { left: 34, right: 34, top: 12, bottom: 16 }
-  const values = [...macd, ...signal, ...histogram].map(row => row.value)
-  const maxAbs = Math.max(0.001, ...values.map(value => Math.abs(value)))
-  const x = (index: number, count: number) => pad.left + (index / Math.max(1, count - 1)) * (width - pad.left - pad.right)
-  const y = (value: number) => pad.top + ((maxAbs - value) / (maxAbs * 2)) * (height - pad.top - pad.bottom)
-  const zeroY = y(0)
-  const macdPath = path(macd.map((row, index) => ({ x: x(index, macd.length), y: y(row.value) })))
-  const signalPath = path(signal.map((row, index) => ({ x: x(index, signal.length), y: y(row.value) })))
-  const barW = Math.max(2, Math.min(12, (width - pad.left - pad.right) / Math.max(1, histogram.length) * 0.55))
+    let disposed = false
+    import('lightweight-charts').then(({ createChart, ColorType }) => {
+      if (disposed || !containerRef.current) return
 
-  return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-full" preserveAspectRatio="none" role="img" aria-label="MACD chart">
-      <rect width={width} height={height} fill="transparent" />
-      <line x1={pad.left} x2={width - pad.right} y1={zeroY} y2={zeroY} stroke="#334155" strokeWidth="1" strokeDasharray="5 5" />
-      {histogram.map((row, index) => {
-        const barX = x(index, histogram.length) - barW / 2
-        const barY = Math.min(y(row.value), zeroY)
-        const barH = Math.max(1, Math.abs(y(row.value) - zeroY))
-        return <rect key={index} x={barX} y={barY} width={barW} height={barH} fill={row.value >= 0 ? 'rgba(16,185,129,0.55)' : 'rgba(239,68,68,0.55)'} rx="1" />
-      })}
-      {macdPath && <path d={macdPath} fill="none" stroke="#38bdf8" strokeWidth="2.2" />}
-      {signalPath && <path d={signalPath} fill="none" stroke="#f59e0b" strokeWidth="2.2" />}
-      <text x={pad.left} y={height - 4} fill="#38bdf8" fontSize="10" fontFamily="monospace">MACD</text>
-      <text x={pad.left + 45} y={height - 4} fill="#f59e0b" fontSize="10" fontFamily="monospace">signal</text>
-    </svg>
-  )
+      if (chartRef.current) { chartRef.current.remove(); chartRef.current = null }
+
+      const chart = createChart(containerRef.current, {
+        width: containerRef.current.clientWidth,
+        height: containerRef.current.clientHeight,
+        layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#94a3b8', fontSize: 11 },
+        grid: { vertLines: { color: '#1e293b' }, horzLines: { color: '#1e293b' } },
+        rightPriceScale: { borderColor: '#334155' },
+        timeScale: { borderColor: '#334155', visible: false },
+      })
+      chartRef.current = chart
+
+      // MACD line
+      const macdSeries = chart.addLineSeries({ color: '#0ea5e9', lineWidth: 2 })
+      macdSeries.setData(data.macd as any)
+
+      // Signal line
+      const signalSeries = chart.addLineSeries({ color: '#f97316', lineWidth: 2 })
+      signalSeries.setData(data.signal as any)
+
+      // Histogram
+      const histSeries = chart.addHistogramSeries({
+        color: '#334155',
+      })
+      histSeries.setData(data.histogram.map(h => ({
+        time: h.time,
+        value: h.value,
+        color: h.value >= 0 ? 'rgba(16, 185, 129, 0.5)' : 'rgba(239, 68, 68, 0.5)',
+      })) as any)
+
+      chart.timeScale().fitContent()
+
+      const ro = new ResizeObserver(entries => {
+        for (const entry of entries) chart.applyOptions({ width: entry.contentRect.width })
+      })
+      ro.observe(containerRef.current)
+      return () => ro.disconnect()
+    })
+
+    return () => { disposed = true; if (chartRef.current) { chartRef.current.remove(); chartRef.current = null } }
+  }, [data])
+
+  return <div ref={containerRef} className="w-full h-full" />
 }

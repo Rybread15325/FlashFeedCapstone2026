@@ -115,6 +115,19 @@ services:
       KAFKA_NEWS_MAX_TICKERS: ${KAFKA_NEWS_MAX_TICKERS:-500}
       DEFAULT_FETCH_MODE: ${DEFAULT_FETCH_MODE:-fast}
       NODE_ENV: development
+      # Hard-disk database — persisted across restarts via the named volume below.
+      DISK_DB_ENABLED: ${DISK_DB_ENABLED:-true}
+      DISK_DB_PATH: /app/data/feedflash_disk.db
+      DISK_TTL_MANUAL_DAYS: ${DISK_TTL_MANUAL_DAYS:-3}
+      DISK_TTL_AUTO_DAYS: ${DISK_TTL_AUTO_DAYS:-2}
+      DISK_TTL_FETCH_DAYS: ${DISK_TTL_FETCH_DAYS:-3}
+      # Automatic fetching (on-site every 20 min; away archiver every 5 min).
+      ONSITE_FETCH_ENABLED: ${ONSITE_FETCH_ENABLED:-true}
+      ONSITE_FETCH_INTERVAL_MS: ${ONSITE_FETCH_INTERVAL_MS:-1200000}
+      ONSITE_FETCH_MODE: ${ONSITE_FETCH_MODE:-fast}
+      AUTO_GRAB_ENABLED: ${AUTO_GRAB_ENABLED:-true}
+    volumes:
+      - feedflash_disk_data:/app/data
     depends_on:
       mongo:
         condition: service_started
@@ -256,3 +269,4 @@ volumes:
   hf_sentiment_cache:
   feedflash_mongo_data:
   frontend_node_modules:
+  feedflash_disk_data:
