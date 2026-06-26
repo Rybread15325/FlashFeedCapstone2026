@@ -109,6 +109,9 @@ def _fetch_tier(tier: str, filter_text: str) -> tuple[str, list[dict], str | Non
         "c": COLUMNS,
         "auth": AUTH_TOKEN,
     }
+    _signal = os.getenv("FINVIZ_SIGNAL", "").strip()
+    if _signal:
+        params["s"] = _signal  # e.g. ta_topgainers -> restrict to Finviz's top-gainers signal
     url = f"{BASE_URL}?{urlencode(params)}"
     resp = None
     for attempt in range(MAX_RETRIES):

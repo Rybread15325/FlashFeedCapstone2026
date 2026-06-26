@@ -26,14 +26,6 @@ type SocialPost = {
   timestamp?: number
 }
 
-type PlatformStatus = {
-  platform: string
-  total: number
-  ticker_matched: number
-  latest_sec?: number
-  status: string
-}
-
 const tabs = [
   { id: 'all', label: 'All' },
   { id: 'reddit', label: 'Reddit' },
@@ -95,7 +87,6 @@ export default function SocialPage() {
   const [error, setError] = useState<string | null>(null)
   const [tickerSearch, setTickerSearch] = useState('')
   const [tickerFilter, setTickerFilter] = useState('')
-  const [platformStatus, setPlatformStatus] = useState<PlatformStatus[]>([])
 
   async function loadSocial(filterTicker = tickerFilter) {
     setLoading(true)
@@ -113,12 +104,10 @@ export default function SocialPage() {
 
       const data = await res.json()
       setPosts(Array.isArray(data.rows) ? data.rows : [])
-      setPlatformStatus(Array.isArray(data.platform_status) ? data.platform_status : [])
       setLastUpdated(Date.now())
     } catch (err: any) {
       setError(err?.message || 'Failed to load social feed')
       setPosts([])
-      setPlatformStatus([])
     } finally {
       setLoading(false)
     }
@@ -186,20 +175,6 @@ export default function SocialPage() {
       .sort((a, b) => b[1] - a[1])
       .slice(0, 12)
   }, [posts])
-
-  const platformCards = useMemo(() => {
-    const byPlatform = new Map(platformStatus.map(row => [row.platform.toLowerCase(), row]))
-    return tabs.filter(tab => tab.id !== 'all').map(tab => {
-      const row = byPlatform.get(tab.label.toLowerCase()) || byPlatform.get(tab.id)
-      return {
-        ...tab,
-        total: row?.total ?? 0,
-        matched: row?.ticker_matched ?? 0,
-        status: row?.status || 'no_rows_in_window',
-        latest: row?.latest_sec,
-      }
-    })
-  }, [platformStatus])
 
   return (
     <div className="p-6 md:p-8 text-white">
@@ -269,22 +244,6 @@ export default function SocialPage() {
           >
             {tab.label}
           </button>
-        ))}
-      </div>
-
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-        {platformCards.map(row => (
-          <div key={row.id} className="border border-slate-700 bg-slate-900/60 rounded-lg px-3 py-2">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-sm font-semibold">{row.label}</span>
-              <span className={row.matched > 0 ? 'text-emerald-300 text-xs' : row.total > 0 ? 'text-yellow-300 text-xs' : 'text-neutral text-xs'}>
-                {row.matched > 0 ? 'working' : row.total > 0 ? 'unmatched' : 'empty'}
-              </span>
-            </div>
-            <div className="mt-1 text-xs text-neutral">
-              {row.matched}/{row.total} ticker matched{row.latest ? ` · latest ${timeAgo(row.latest)}` : ''}
-            </div>
-          </div>
         ))}
       </div>
 

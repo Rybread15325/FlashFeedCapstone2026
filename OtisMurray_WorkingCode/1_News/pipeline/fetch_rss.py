@@ -78,7 +78,7 @@ HEADERS = {
     "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
     "Accept-Language": "en-US,en;q=0.9",
 }
-SEC_CONTACT_EMAIL = os.environ.get("SEC_CONTACT_EMAIL", "otisemurray@icloud.com")
+SEC_CONTACT_EMAIL = os.environ.get("SEC_CONTACT_EMAIL", "contact@example.com")
 SEC_HEADERS = {
     **HEADERS,
     "User-Agent": f"FeedFlash/1.0 {SEC_CONTACT_EMAIL}",
@@ -106,7 +106,6 @@ RSS_FEEDS: list[tuple[str, str, str]] = [
     ("SEC EDGAR 10-Q",        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-Q&dateb=&owner=include&count=100&search_text=&output=atom", "filings"),
     ("SEC EDGAR 10-K",        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-K&dateb=&owner=include&count=100&search_text=&output=atom", "filings"),
     ("PR Newswire",           "https://www.prnewswire.com/rss/news-releases-list.rss",                               "press_releases"),
-    ("PR Newswire Financial", "https://www.prnewswire.com/rss/financial-services-latest-news/financial-services-latest-news-list.rss", "press_releases"),
     # Team candidate returned no RSS/Atom entries on 2026-06-12; keep disabled until a valid BusinessWire feed is confirmed.
     # ("BusinessWire",          "https://feed.businesswire.com/rss/home/?rss=G1",                                      "press_releases"),
     ("GlobeNewswire Public Companies", "https://www.globenewswire.com/RssFeed/orgclass/1",                            "press_releases"),

@@ -1,57 +1,37 @@
-# Dependencies
-node_modules/
-*.node
-
-# Environment files
+﻿# Environment
 .env
-.env.local
-.env.*.local
+*.env.local
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Docker
-.docker/
-docker-compose.override.yml
-
-# Logs
-*.log
-npm-debug.log*
-
-# Build output
+# Node
+node_modules/
+app/node_modules/
 dist/
 build/
-*.tsbuildinfo
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
-*.egg-info/
 .venv/
 venv/
 
-# Runtime
-.pm2/
+# Docker volumes / local data
+*.sqlite
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
 logs/
-*.pid
 
-# Testing
-coverage/
-.nyc_output/
-
-# Temp
-tmp/
-temp/
-*.tmp
-
-# Backup files
-*.bak
-*.bak_*
-*.DISABLED*
-.rss_fetch_state.json
+# HuggingFace model cache (large, auto-downloaded)
+hf_cache/

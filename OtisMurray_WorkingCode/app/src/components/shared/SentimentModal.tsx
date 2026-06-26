@@ -21,17 +21,7 @@ type SentimentRow = {
   ticker?: string
   title?: string
   source?: string
-  url?: string
-  sentiment?: string
   sentiment_score?: number
-  confidence?: number
-}
-
-function dateTime(value: string | number | null | undefined) {
-  if (!value) return '--'
-  const ms = typeof value === 'number' ? (value > 1_000_000_000_000 ? value : value * 1000) : Date.parse(value)
-  if (!Number.isFinite(ms)) return '--'
-  return new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 }
 
 export function SentimentModal({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -46,25 +36,14 @@ export function SentimentModal({ open, onClose }: { open: boolean; onClose: () =
   const newsAvg = Number(summary.avg_sentiment ?? 0)
   const socialAvg = Number(summary.social_avg_sentiment ?? 0)
   const sourceCount = Array.isArray(data?.sources) ? data.sources.length : 0
-  const scored = Number(summary.scored || 0)
-  const tickerMatched = Number(summary.ticker_matched || 0)
-  const coverage = tickerMatched ? Math.round((scored / tickerMatched) * 100) : 0
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto overscroll-contain bg-black/60 p-4" onClick={onClose}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="sentiment-snapshot-title"
-        className="mx-auto my-4 flex max-h-[calc(100vh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-surface shadow-2xl sm:my-8 sm:max-h-[calc(100vh-4rem)]"
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="flex flex-shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+      <div className="bg-surface border border-border rounded-lg w-full max-w-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
           <div>
-            <div id="sentiment-snapshot-title" className="text-white font-semibold">Sentiment Snapshot</div>
-            <div className="text-xs text-neutral">
-              Last 3 days news · 24h social · generated {dateTime(data?.generated_at)}
-            </div>
+            <div className="text-white font-semibold">Sentiment Snapshot</div>
+            <div className="text-xs text-neutral">Last 3 days news · 24h social · ticker matched</div>
           </div>
           <button
             onClick={onClose}
@@ -75,29 +54,23 @@ export function SentimentModal({ open, onClose }: { open: boolean; onClose: () =
           </button>
         </div>
 
-        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+        <div className="p-4 space-y-3">
           {data?.ok === false && (
             <div className="border border-red-500/40 bg-red-500/10 text-red-200 text-sm rounded p-3">
               {data.error || 'Sentiment snapshot failed.'}
             </div>
           )}
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <div className="grid grid-cols-3 gap-2">
             <Metric label="Combined Avg" value={isLoading ? '...' : `${combinedAvg > 0 ? '+' : ''}${combinedAvg.toFixed(3)}`} toneClass={scoreTone(combinedAvg)} />
             <Metric label="News Avg" value={`${newsAvg > 0 ? '+' : ''}${newsAvg.toFixed(3)}`} toneClass={scoreTone(newsAvg)} />
             <Metric label="Social Avg" value={`${socialAvg > 0 ? '+' : ''}${socialAvg.toFixed(3)}`} toneClass={scoreTone(socialAvg)} />
           </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <div className="grid grid-cols-4 gap-2">
             <Metric label="Actionable" value={compact(summary.actionable)} toneClass="text-emerald-300" />
             <Metric label="Tickered News" value={`${compact(summary.ticker_matched)}/${compact(summary.total)}`} />
-            <Metric label="Scored News" value={`${compact(scored)} (${coverage}%)`} toneClass={coverage < 25 ? 'text-yellow-300' : 'text-slate-100'} />
-            <Metric label="Sources" value={compact(sourceCount)} />
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
             <Metric label="Social Posts" value={compact(summary.social_total)} />
-            <Metric label="Bullish Social" value={compact(summary.social_bullish)} toneClass="text-emerald-300" />
-            <Metric label="Bearish Social" value={compact(summary.social_bearish)} toneClass="text-red-300" />
-            <Metric label="Neutral Social" value={compact(summary.social_neutral)} />
+            <Metric label="Sources" value={compact(sourceCount)} />
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -107,7 +80,7 @@ export function SentimentModal({ open, onClose }: { open: boolean; onClose: () =
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <Breakdown title="Top Sources" rows={data?.sources ?? []} labelKey="source" />
-            <Breakdown title="Active Tickers" rows={data?.ticker_breakdown ?? []} labelKey="ticker" tickerLinks />
+            <Breakdown title="Active Tickers" rows={data?.ticker_breakdown ?? []} labelKey="ticker" />
           </div>
         </div>
       </div>
@@ -124,7 +97,7 @@ function Metric({ label, value, toneClass = 'text-slate-100' }: { label: string;
   )
 }
 
-function Breakdown({ title, rows, labelKey, tickerLinks = false }: { title: string; rows: any[]; labelKey: string; tickerLinks?: boolean }) {
+function Breakdown({ title, rows, labelKey }: { title: string; rows: any[]; labelKey: string }) {
   const list = Array.isArray(rows) ? rows.slice(0, 5) : []
   return (
     <section className="border border-border rounded overflow-hidden">
@@ -132,21 +105,13 @@ function Breakdown({ title, rows, labelKey, tickerLinks = false }: { title: stri
       <div className="divide-y divide-slate-700/30">
         {list.length ? list.map(row => {
           const avg = Number(row.avg_sentiment ?? 0)
-          const label = row[labelKey] || 'Unknown'
-          const scored = Number(row.scored || 0)
-          const content = <span className="text-slate-200 truncate">{label}</span>
           return (
             <div key={`${row[labelKey]}-${row.count}`} className="px-3 py-2 flex items-center gap-2 text-xs">
-              {tickerLinks && label !== 'Unknown'
-                ? <a href={`/news?ticker=${encodeURIComponent(label)}`} className="truncate hover:text-accent">{content}</a>
-                : content}
+              <span className="text-slate-200 truncate">{row[labelKey] || 'Unknown'}</span>
               <span className="ml-auto text-neutral font-mono">{compact(row.count)}</span>
               <span className={clsx('font-mono w-12 text-right', scoreTone(avg))}>
                 {avg > 0 ? '+' : ''}{avg.toFixed(2)}
               </span>
-              {Number.isFinite(scored) && scored === 0 && (
-                <span className="w-16 text-right text-[10px] uppercase text-yellow-300">unscored</span>
-              )}
             </div>
           )
         }) : (
@@ -164,8 +129,8 @@ function List({ title, rows, empty, negative = false }: { title: string; rows: S
       <div className="divide-y divide-slate-700/30">
         {rows.length ? rows.map(row => {
           const score = Number(row.sentiment_score ?? 0)
-          const rowBody = (
-            <>
+          return (
+            <div key={row.id || row.title} className="px-3 py-2">
               <div className="flex items-center gap-2 text-[11px] mb-1">
                 <span className="font-mono text-accent">{row.ticker || '--'}</span>
                 <span className="text-neutral truncate">{row.source || 'Source'}</span>
@@ -174,16 +139,7 @@ function List({ title, rows, empty, negative = false }: { title: string; rows: S
                 </span>
               </div>
               <div className="text-xs text-slate-200 line-clamp-2">{row.title || 'Untitled headline'}</div>
-            </>
-          )
-          return (
-            row.url ? (
-              <a key={row.id || row.title} href={row.url} target="_blank" rel="noreferrer" className="block px-3 py-2 hover:bg-bg/40">
-                {rowBody}
-              </a>
-            ) : (
-              <div key={row.id || row.title} className="px-3 py-2">{rowBody}</div>
-            )
+            </div>
           )
         }) : (
           <div className="px-3 py-5 text-sm text-neutral text-center">{empty}</div>

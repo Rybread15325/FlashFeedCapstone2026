@@ -49,7 +49,7 @@ BAD_TITLE_CONTAINS = [
 
 FINANCE_HINTS = [
     "stock", "stocks", "market", "markets", "shares", "earnings", "revenue",
-    "profit", "guidance", "fed", "rate", "inflation",
+    "profit", "guidance", "fed", "rate", "inflation", "oil",
     "sec", "ipo", "merger", "acquisition", "deal", "dow",
     "nasdaq", "s&p", "bond", "treasury", "futures", "trading", "investors",
     "bank", "banks", "finance", "economy", "economic", "ai", "chip",
@@ -310,6 +310,7 @@ def main():
     total_found = 0
     article_upserted = 0
     article_modified = 0
+    kafka_publish_docs = []
 
     for cfg in sources:
         docs = fetch_source(cfg)
@@ -342,11 +343,24 @@ def main():
             print("BulkWriteError for", cfg["source"])
             print(e.details)
 
+        kafka_publish_docs.extend(docs)
+
     print("\nUnstructured import complete:", {
         "found": total_found,
         "upserted": article_upserted,
         "modified": article_modified
     })
+
+    # --- OPTIONAL Kafka publish (additive; OFF unless KAFKA_PUBLISH_NEWS=true) ---
+    if os.getenv("KAFKA_PUBLISH_NEWS", "false").strip().lower() in ("1", "true", "yes"):
+        try:
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Infrastructure", "kafka"))
+            from news_publisher import publish_articles
+            _sent = publish_articles(kafka_publish_docs)
+            print(f"Kafka publish — {_sent} news events sent to topic")
+        except Exception as exc:
+            print(f"Kafka publish skipped (Mongo import unaffected): {exc}")
 
     client.close()
 

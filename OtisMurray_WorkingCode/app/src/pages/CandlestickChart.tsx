@@ -1,281 +1,124 @@
 'use client'
 import { useEffect, useRef } from 'react'
-import { ColorType, CrosshairMode, LineStyle, createChart } from 'lightweight-charts'
 
-interface Candle { time: string | number; open: number; high: number; low: number; close: number; volume?: number }
-interface SeriesPoint { time: string | number; value: number; scaled?: number; count?: number }
-interface BollingerData { upper: SeriesPoint[]; lower: SeriesPoint[] }
-interface NewsEvent {
-  time: string | number
-  position?: string
-  color?: string
-  shape?: string
-  text?: string
-  title?: string
-  source?: string
-}
+interface Candle { time: string; open: number; high: number; low: number; close: number }
+interface BollingerData { upper: Array<{ time: string; value: number }>; lower: Array<{ time: string; value: number }> }
+interface LinePoint { time: number; value: number }
 
 interface Props {
   candles: Candle[]
   bollinger?: BollingerData
-  predicted?: SeriesPoint[]
-  density?: SeriesPoint[]
-  sentiment?: SeriesPoint[]
-  newsEvents?: NewsEvent[]
-  showSentiment?: boolean
-  showDensity?: boolean
-  showBollinger?: boolean
-  showPrediction?: boolean
-  chartStyle?: 'line' | 'candles'
+  // Optional overlays on independent secondary scales (their units differ from
+  // price): smoothed message density (msgs/min) and sentiment score (−1..+1).
+  // Undefined = not shown. Mirrors the research views' orange/green styling.
+  densityOverlay?: LinePoint[]
+  sentimentOverlay?: LinePoint[]
 }
 
-function finiteNumber(value: unknown, fallback = 0) {
-  const n = Number(value)
-  return Number.isFinite(n) ? n : fallback
-}
-
-function normalizeTime(value: string | number) {
-  if (typeof value === 'number') return value
-  const parsed = Date.parse(value)
-  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : Number(value) || 0
-}
-
-function normalizeSeries<T extends { time: string | number }>(rows: T[], mapper: (row: T) => Record<string, unknown>) {
-  const byTime = new Map<number, Record<string, unknown>>()
-  rows.forEach(row => {
-    const time = normalizeTime(row.time)
-    if (time > 0) byTime.set(time, { ...mapper(row), time })
-  })
-  return [...byTime.values()].sort((a, b) => Number(a.time) - Number(b.time))
-}
-
-function percentile(value: number, max: number) {
-  if (!Number.isFinite(value) || !Number.isFinite(max) || max <= 0) return 0
-  return Math.max(0, Math.min(100, (value / max) * 100))
-}
-
-export function CandlestickChart({
-  candles,
-  bollinger,
-  predicted = [],
-  density = [],
-  sentiment = [],
-  newsEvents = [],
-  showSentiment = true,
-  showDensity = true,
-  showBollinger = false,
-  showPrediction = false,
-  chartStyle = 'line',
-}: Props) {
+export function CandlestickChart({ candles, bollinger, densityOverlay, sentimentOverlay }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const chartRef = useRef<ReturnType<typeof createChart> | null>(null)
+  const chartRef = useRef<any>(null)
 
   useEffect(() => {
-    const container = containerRef.current
-    if (!container) return
+    if (!containerRef.current || candles.length === 0) return
 
-    const candleData = normalizeSeries(candles, candle => ({
-      open: finiteNumber(candle.open),
-      high: finiteNumber(candle.high),
-      low: finiteNumber(candle.low),
-      close: finiteNumber(candle.close),
-    })).filter(candle =>
-      Number(candle.open) > 0 &&
-      Number(candle.high) > 0 &&
-      Number(candle.low) > 0 &&
-      Number(candle.close) > 0
-    )
+    let disposed = false
+    import('lightweight-charts').then(({ createChart, ColorType, CrosshairMode }) => {
+      if (disposed || !containerRef.current) return
 
-    if (!candleData.length) {
-      container.innerHTML = '<div class="w-full h-full flex items-center justify-center text-sm text-neutral">No candle data</div>'
-      return
-    }
+      // Clear previous chart
+      if (chartRef.current) {
+        chartRef.current.remove()
+        chartRef.current = null
+      }
 
-    container.innerHTML = ''
-    chartRef.current?.remove()
-
-    const chart = createChart(container, {
-      width: container.clientWidth,
-      height: container.clientHeight || 340,
-      layout: {
-        background: { type: ColorType.Solid, color: 'transparent' },
-        textColor: '#8b8f98',
-        fontSize: 12,
-      },
-      grid: {
-        vertLines: { color: 'rgba(148, 163, 184, 0.09)' },
-        horzLines: { color: 'rgba(148, 163, 184, 0.14)' },
-      },
-      crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: {
-        borderColor: 'rgba(148, 163, 184, 0.25)',
-        scaleMargins: { top: 0.08, bottom: 0.22 },
-      },
-      leftPriceScale: {
-        visible: showSentiment || showDensity,
-        borderColor: 'rgba(148, 163, 184, 0.15)',
-        scaleMargins: { top: 0.12, bottom: 0.22 },
-      },
-      timeScale: {
-        borderColor: 'rgba(148, 163, 184, 0.25)',
-        timeVisible: true,
-        secondsVisible: false,
-      },
-    })
-    chartRef.current = chart
-
-    const closeLine = candleData.map(candle => ({ time: candle.time, value: Number(candle.close) }))
-    const lastClose = closeLine.at(-1)?.value ?? closeLine.at(0)?.value ?? 0
-    const firstClose = closeLine[0]?.value ?? lastClose
-    const priceUp = lastClose >= firstClose
-    const trendColor = priceUp ? '#11b981' : '#ef4444'
-    const priceColor = chartStyle === 'line' ? '#22c7a4' : trendColor
-
-    const priceSeries = chartStyle === 'candles'
-      ? chart.addCandlestickSeries({
-          upColor: '#10b981',
-          downColor: '#ef4444',
-          borderUpColor: '#10b981',
-          borderDownColor: '#ef4444',
-          wickUpColor: '#10b981',
-          wickDownColor: '#ef4444',
-        })
-      : chart.addAreaSeries({
-          lineColor: priceColor,
-          topColor: 'rgba(34, 199, 164, 0.16)',
-          bottomColor: 'rgba(17, 185, 129, 0)',
-          lineWidth: 3,
-          priceLineColor: priceColor,
-          lastValueVisible: true,
-          priceLineVisible: true,
-        })
-
-    if (chartStyle === 'candles') {
-      priceSeries.setData(candleData as any)
-    } else {
-      priceSeries.setData(closeLine as any)
-    }
-
-    const volumeData = candleData
-      .filter(candle => Number(candle.volume || 0) > 0)
-      .map(candle => ({
-        time: candle.time,
-        value: Number(candle.volume || 0),
-        color: Number(candle.close) >= Number(candle.open)
-          ? 'rgba(34, 199, 164, 0.35)'
-          : 'rgba(239, 68, 68, 0.32)',
-      }))
-    if (volumeData.length) {
-      const volumeSeries = chart.addHistogramSeries({
-        priceScaleId: 'volume',
-        priceFormat: { type: 'volume' },
-        priceLineVisible: false,
-        lastValueVisible: false,
+      const chart = createChart(containerRef.current, {
+        width: containerRef.current.clientWidth,
+        height: containerRef.current.clientHeight,
+        layout: {
+          background: { type: ColorType.Solid, color: 'transparent' },
+          textColor: '#94a3b8',
+          fontSize: 11,
+        },
+        grid: {
+          vertLines: { color: '#1e293b' },
+          horzLines: { color: '#1e293b' },
+        },
+        crosshair: { mode: CrosshairMode.Normal },
+        rightPriceScale: { borderColor: '#334155' },
+        timeScale: { borderColor: '#334155', timeVisible: true },
       })
-      volumeSeries.setData(volumeData as any)
-      chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
-    }
+      chartRef.current = chart
 
-    const upper = normalizeSeries(bollinger?.upper || [], point => ({ value: finiteNumber(point.value, NaN) }))
-      .filter(point => Number.isFinite(point.value))
-    const lower = normalizeSeries(bollinger?.lower || [], point => ({ value: finiteNumber(point.value, NaN) }))
-      .filter(point => Number.isFinite(point.value))
-
-    if (showBollinger && upper.length) {
-      const upperSeries = chart.addLineSeries({
-        color: 'rgba(139, 92, 246, 0.55)',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        priceLineVisible: false,
-        lastValueVisible: false,
+      const candleSeries = chart.addCandlestickSeries({
+        upColor: '#10b981',
+        downColor: '#ef4444',
+        borderUpColor: '#10b981',
+        borderDownColor: '#ef4444',
+        wickUpColor: '#10b981',
+        wickDownColor: '#ef4444',
       })
-      upperSeries.setData(upper as any)
-    }
+      candleSeries.setData(candles as any)
 
-    if (showBollinger && lower.length) {
-      const lowerSeries = chart.addLineSeries({
-        color: 'rgba(139, 92, 246, 0.55)',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        priceLineVisible: false,
-        lastValueVisible: false,
-      })
-      lowerSeries.setData(lower as any)
-    }
-
-    const predictionData = normalizeSeries(predicted, point => ({ value: finiteNumber(point.value, NaN) }))
-      .filter(point => Number.isFinite(point.value))
-    if (showPrediction && predictionData.length) {
-      const predictionSeries = chart.addLineSeries({
-        color: '#f59e0b',
-        lineWidth: 2,
-        lineStyle: LineStyle.Dashed,
-        priceLineVisible: false,
-      })
-      predictionSeries.setData(predictionData as any)
-    }
-
-    if (showDensity) {
-      const maxDensity = Math.max(...density.map(point => finiteNumber(point.scaled ?? point.value, 0)), 0)
-      const densityData = normalizeSeries(density, point => ({ value: percentile(finiteNumber(point.scaled ?? point.value, 0), maxDensity) }))
-        .filter(point => Number.isFinite(point.value))
-      if (densityData.length) {
-        const densitySeries = chart.addLineSeries({
-          color: '#ff6d1f',
+      // Bollinger bands
+      if (bollinger) {
+        const upperSeries = chart.addLineSeries({
+          color: 'rgba(139, 92, 246, 0.5)',
           lineWidth: 1,
-          priceScaleId: 'left',
-          priceLineVisible: false,
-          lastValueVisible: true,
-          crosshairMarkerVisible: false,
+          lineStyle: 2,
         })
-        densitySeries.setData(densityData as any)
-      }
-    }
+        upperSeries.setData(bollinger.upper as any)
 
-    if (showSentiment) {
-      const sentimentData = normalizeSeries(sentiment, point => ({ value: Math.max(0, Math.min(100, (finiteNumber(point.value, 0) + 1) * 50)) }))
-        .filter(point => Number.isFinite(point.value))
-      if (sentimentData.length) {
-        const sentimentSeries = chart.addLineSeries({
-          color: '#7c3cff',
+        const lowerSeries = chart.addLineSeries({
+          color: 'rgba(139, 92, 246, 0.5)',
           lineWidth: 1,
-          priceScaleId: 'left',
-          priceLineVisible: false,
-          lastValueVisible: true,
-          crosshairMarkerVisible: false,
+          lineStyle: 2,
         })
-        sentimentSeries.setData(sentimentData as any)
+        lowerSeries.setData(bollinger.lower as any)
       }
-    }
 
-    if (newsEvents.length) {
-      priceSeries.setMarkers(newsEvents.slice(-40).map(event => ({
-        time: normalizeTime(event.time) as any,
-        position: event.position === 'aboveBar' ? 'aboveBar' : 'belowBar',
-        color: event.color || (event.position === 'aboveBar' ? '#ef4444' : '#10b981'),
-        shape: event.shape === 'arrowDown' ? 'arrowDown' : 'arrowUp',
-        text: event.text || (event.source || 'News').slice(0, 5),
-      })))
-    }
-
-    chart.timeScale().fitContent()
-
-    const resizeObserver = new ResizeObserver(entries => {
-      for (const entry of entries) {
-        chart.applyOptions({
-          width: Math.max(1, Math.floor(entry.contentRect.width)),
-          height: Math.max(1, Math.floor(entry.contentRect.height || 340)),
+      // Density overlay (msgs/min, smoothed) — orange, lower band, own scale so
+      // its magnitude never distorts the price axis.
+      if (densityOverlay && densityOverlay.length) {
+        const dens = chart.addLineSeries({
+          color: '#FF9800', lineWidth: 2, priceScaleId: 'density',
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
         })
+        dens.setData(densityOverlay as any)
+        chart.priceScale('density').applyOptions({ scaleMargins: { top: 0.72, bottom: 0 } })
       }
+
+      // Sentiment overlay (−1..+1, 15-min smoothed) — green, own scale.
+      if (sentimentOverlay && sentimentOverlay.length) {
+        const sent = chart.addLineSeries({
+          color: '#4CAF50', lineWidth: 2, priceScaleId: 'sentiment',
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        sent.setData(sentimentOverlay as any)
+        chart.priceScale('sentiment').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.72 } })
+      }
+
+      chart.timeScale().fitContent()
+
+      // Resize observer
+      const ro = new ResizeObserver(entries => {
+        for (const entry of entries) {
+          chart.applyOptions({ width: entry.contentRect.width })
+        }
+      })
+      ro.observe(containerRef.current)
+
+      return () => { ro.disconnect() }
     })
-    resizeObserver.observe(container)
 
     return () => {
-      resizeObserver.disconnect()
-      chart.remove()
-      chartRef.current = null
+      disposed = true
+      if (chartRef.current) {
+        chartRef.current.remove()
+        chartRef.current = null
+      }
     }
-  }, [candles, bollinger, predicted, density, sentiment, newsEvents, showDensity, showSentiment, showBollinger, showPrediction, chartStyle])
+  }, [candles, bollinger, densityOverlay, sentimentOverlay])
 
-  return <div ref={containerRef} className="w-full h-full min-h-[340px]" />
+  return <div ref={containerRef} className="w-full h-full" />
 }

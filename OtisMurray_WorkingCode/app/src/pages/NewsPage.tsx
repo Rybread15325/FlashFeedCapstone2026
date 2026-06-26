@@ -1,7 +1,6 @@
 'use client'
 import useSWR from 'swr'
 import { useState, useMemo } from 'react'
-import { useSearchParams } from 'react-router-dom'
 import { NewsRow } from './NewsRow'
 import { NewsSidebar } from './NewsSidebar'
 import { ArticleFilters } from './ArticleFilters'
@@ -10,22 +9,13 @@ import type { Article } from '@/lib/types'
 const fetcher = (url: string) => fetch(url).then(r => r.json())
 
 export function NewsPage() {
-  const [searchParams] = useSearchParams()
-  const initialTicker = searchParams.get('ticker')?.toUpperCase().replace(/[^A-Z0-9.-]/g, '') || ''
-  const [filters, setFilters] = useState<Record<string, string>>(initialTicker ? { ticker: initialTicker } : {})
+  const [filters, setFilters] = useState<Record<string, string>>({})
   const [page, setPage] = useState(0)
   const [keywordsOnly, setKeywordsOnly] = useState(false)
   const [moversOnly, setMoversOnly] = useState(false)
   const limit = 30
 
   const params = new URLSearchParams({ ...filters, limit: String(limit), offset: String(page * limit) })
-
-  // Main News Feed should show today's usable news by default.
-  // SEC filings are still stored, but hidden by the backend unless include_filings=1.
-  if (!params.has('recent_days') && !params.has('from') && !params.has('to')) {
-    params.set('recent_days', '1')
-  }
-
   if (keywordsOnly) params.set('keywords_only', '1')
   if (moversOnly) params.set('mover_only', '1')
   const { data, isLoading } = useSWR(`/api/articles?${params}`, fetcher, { refreshInterval: 15_000 })

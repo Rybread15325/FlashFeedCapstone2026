@@ -85,8 +85,9 @@ export function OverviewPage() {
   const targetLanguage = useTargetLanguage()
   const { data: stats } = useSWR('/api/stats?days=2', fetcher, { refreshInterval: 30_000 })
   const { data: status } = useSWR('/api/status', fetcher, { refreshInterval: 30_000 })
-  const { data: articlesData } = useSWR('/api/articles?limit=30&ticker_only=1&mover_only=1&recent_days=2', fetcher, { refreshInterval: 15_000 })
+  const { data: articlesData } = useSWR('/api/articles?limit=30&ticker_only=1&mover_only=1&recent_days=14', fetcher, { refreshInterval: 15_000 })
   const { data: socialData } = useSWR('/api/social/rolling?window_minutes=1440&limit=30&ranked=1', fetcher, { refreshInterval: 30_000 })
+  const { data: aiOverview } = useSWR('/api/ai/overview?days=3', fetcher, { refreshInterval: 60_000 })
   const { data: socialStats } = useSWR('/api/social/rolling/stats?window_minutes=1440', fetcher, { refreshInterval: 30_000 })
   const { data: correlationData } = useSWR('/api/correlation', fetcher, { refreshInterval: 60_000 })
   const { data: auditData } = useSWR('/api/sentiment/audit?limit=8&days=3', fetcher, { refreshInterval: 60_000 })
@@ -136,8 +137,25 @@ export function OverviewPage() {
         <Metric label="Bullish News" value={compact(bullishArticles)} tone="text-emerald-400" />
         <Metric label="Bearish News" value={compact(bearishArticles)} tone="text-red-400" />
         <Metric label="Social Signals" value={compact(socialTotal)} tone="text-indigo-300" />
-        <Metric label="Correlation" value={pearsonR == null ? '--' : pearsonR.toFixed(2)} tone="text-yellow-300" />
+        <Metric label="Pearson r" value={pearsonR == null ? '--' : pearsonR.toFixed(2)} tone="text-yellow-300" />
       </div>
+
+      <section className="bg-surface border border-border rounded-lg p-4">
+        <div className="flex items-center justify-between gap-3 mb-1">
+          <h2 className="text-white font-medium flex items-center gap-2"><span className="text-accent">✦</span> AI Overview</h2>
+          {aiOverview?.mood && (
+            <span className={`text-xs font-semibold uppercase ${aiOverview.mood === 'risk-on' ? 'text-emerald-400' : aiOverview.mood === 'risk-off' ? 'text-red-400' : 'text-yellow-300'}`}>{aiOverview.mood}</span>
+          )}
+        </div>
+        <p className="text-sm text-neutral leading-relaxed">{aiOverview?.summary || 'Analyzing the last few days of news…'}</p>
+        {(aiOverview?.top_bullish?.length || aiOverview?.top_bearish?.length) ? (
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-1 mt-2 text-xs">
+            {aiOverview?.top_bullish?.length ? <span className="text-neutral">Bullish: <span className="text-emerald-400">{aiOverview.top_bullish.slice(0, 4).map((b: any) => b.ticker).join(', ')}</span></span> : null}
+            {aiOverview?.top_bearish?.length ? <span className="text-neutral">Bearish: <span className="text-red-400">{aiOverview.top_bearish.slice(0, 4).map((b: any) => b.ticker).join(', ')}</span></span> : null}
+            <a href="/ai" className="text-accent hover:underline ml-auto">Open AI tab →</a>
+          </div>
+        ) : null}
+      </section>
 
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.9fr)_minmax(300px,0.8fr)] gap-4">
         <section className="min-w-0 bg-surface border border-border rounded-lg overflow-hidden">

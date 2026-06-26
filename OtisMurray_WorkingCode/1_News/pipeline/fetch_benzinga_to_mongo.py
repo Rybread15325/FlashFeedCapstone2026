@@ -133,6 +133,18 @@ def main() -> None:
 
     record_source_status(db, "Benzinga", "working", count=len(docs), source_type="structured_news")
     print(f"Benzinga import complete — {len(docs)} found, {upserted} new, {modified} updated")
+
+    # --- OPTIONAL Kafka publish (additive; OFF unless KAFKA_PUBLISH_NEWS=true) ---
+    if os.getenv("KAFKA_PUBLISH_NEWS", "false").strip().lower() in ("1", "true", "yes"):
+        try:
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Infrastructure", "kafka"))
+            from news_publisher import publish_articles
+            _sent = publish_articles(docs)
+            print(f"Kafka publish — {_sent} news events sent to topic")
+        except Exception as exc:
+            print(f"Kafka publish skipped (Mongo import unaffected): {exc}")
+
     client.close()
 
 

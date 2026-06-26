@@ -2,6 +2,8 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { fileURLToPath, URL } from 'node:url'
 
+const BACKEND = process.env.VITE_BACKEND_URL || 'http://localhost:3001'
+
 export default defineConfig({
   plugins: [react()],
   resolve: {
@@ -10,8 +12,9 @@ export default defineConfig({
     },
   },
   server: {
+    host: '0.0.0.0',
     proxy: {
-      '/api': 'http://localhost:3001',
+      '/api': BACKEND,
     },
   },
 })

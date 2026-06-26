@@ -104,23 +104,14 @@ export function ScreenerRow({ row, columns }: Props) {
           </span>
         )
       case 'social_message_sentiment':
-        const allSocialSentiment = row.social_message_sentiment ?? row.social_sentiment ?? 0
-        return (
-          <span className={clsx('font-mono', allSocialSentiment >= 0.2 ? 'text-emerald-400' : allSocialSentiment <= -0.2 ? 'text-red-400' : 'text-neutral')}>
-            {allSocialSentiment.toFixed(2)}
-          </span>
-        )
-      case 'social_message_density':
-        return <span className="font-mono text-neutral">{(row.social_message_density ?? 0).toFixed(3)}/m</span>
-      case 'stocktwits_message_sentiment':
-        const stocktwitsSentiment = row.stocktwits_message_sentiment ?? 0
+        const stocktwitsSentiment = row.social_message_sentiment ?? 0
         return (
           <span className={clsx('font-mono', stocktwitsSentiment >= 0.2 ? 'text-emerald-400' : stocktwitsSentiment <= -0.2 ? 'text-red-400' : 'text-neutral')}>
             {stocktwitsSentiment.toFixed(2)}
           </span>
         )
-      case 'stocktwits_message_density':
-        return <span className="font-mono text-neutral">{(row.stocktwits_message_density ?? 0).toFixed(3)}/m</span>
+      case 'social_message_density':
+        return <span className="font-mono text-neutral">{(row.social_message_density ?? 0).toFixed(3)}/m</span>
       case 'stocktwits_message_count':
         return <span className="font-mono text-neutral">{row.stocktwits_message_count ?? 0}</span>
       case 'structured_sentiment':

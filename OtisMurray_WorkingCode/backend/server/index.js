@@ -14,11 +14,7 @@ const app  = express()
 const PORT = process.env.PORT || 3001
 
 // ── Middleware ────────────────────────────────────────────
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*'
-const corsOptions = CORS_ORIGIN === '*'
-  ? { origin: '*' }
-  : { origin: CORS_ORIGIN.split(',').map(s => s.trim()) }
-app.use(cors(corsOptions))
+app.use(cors({ origin: ['http://localhost:5173', 'http://127.0.0.1:5173'] }))
 app.use(express.json({ limit: '2mb' }))
 
 

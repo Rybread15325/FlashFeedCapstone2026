@@ -37,7 +37,7 @@ export function ScreenerPage() {
   const screenerParams = new URLSearchParams({ limit: '1500' })
   if (socialWindow !== 'adaptive') screenerParams.set('window_minutes', socialWindow)
   const { data, isLoading, mutate } = useSWR(`/api/screener?${screenerParams.toString()}`, fetcher, { refreshInterval: 30_000 })
-  const { data: newsData } = useSWR('/api/articles?mover_only=1&ticker_only=1&recent_days=2&limit=24', fetcher, { refreshInterval: 30_000 })
+  const { data: newsData } = useSWR('/api/articles?mover_only=1&ticker_only=1&recent_days=14&limit=24', fetcher, { refreshInterval: 30_000 })
   const [filters, setFilters] = useState<Record<string, string>>({})
   const [showFilters, setShowFilters] = useState(false)
   const [filterTab, setFilterTab] = useState<FilterTab>('all')
@@ -142,7 +142,7 @@ export function ScreenerPage() {
     if (filters.stocktwits_sentiment) {
       const ss = filters.stocktwits_sentiment
       rows = rows.filter(t => {
-        const value = t.stocktwits_message_sentiment ?? 0
+        const value = t.social_message_sentiment ?? 0
         if (ss === 'bullish') return value >= 0.2
         if (ss === 'bearish') return value <= -0.2
         if (ss === 'neutral') return value > -0.2 && value < 0.2
@@ -151,7 +151,7 @@ export function ScreenerPage() {
     }
     if (filters.stocktwits_density) {
       rows = rows.filter(t => {
-        const value = t.stocktwits_message_density ?? 0
+        const value = t.social_message_density ?? 0
         if (filters.stocktwits_density === 'over0_05') return value >= 0.05
         if (filters.stocktwits_density === 'over0_1') return value >= 0.1
         if (filters.stocktwits_density === 'over0_5') return value >= 0.5
@@ -310,7 +310,7 @@ export function ScreenerPage() {
       current.totalMsgs += totalMessages
       current.stocktwitsMsgs += stocktwitsMessages
       current.totalDensity += totalDensity
-      current.stocktwitsDensity += Number(row.stocktwits_message_density ?? 0)
+      current.stocktwitsDensity += Number(row.social_message_density ?? 0)
       if (totalMessages > 0) current.activeSocial += 1
       groups.set(sector, current)
     }

@@ -21,13 +21,12 @@ from pymongo import MongoClient, UpdateOne
 from pymongo.errors import OperationFailure
 
 from sentiment_utils import classify_financial_event, score_financial_sentiment
-from source_status import record_source_status
 
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/feedflash")
 DB_NAME = os.getenv("MONGODB_DB", os.getenv("MONGO_DB", "feedflash"))
-MAX_TICKERS = int(os.getenv("TRADINGVIEW_MAX_TICKERS", "80"))
-MAX_WORKERS = int(os.getenv("TRADINGVIEW_MAX_WORKERS", "8"))
-MAX_PER_TICKER = int(os.getenv("TRADINGVIEW_MAX_PER_TICKER", "20"))
+MAX_TICKERS = int(os.getenv("TRADINGVIEW_MAX_TICKERS", os.getenv("SOCIAL_MAX_TICKERS", "10")))
+MAX_WORKERS = int(os.getenv("TRADINGVIEW_MAX_WORKERS", "6"))
+MAX_PER_TICKER = int(os.getenv("TRADINGVIEW_MAX_PER_TICKER", "8"))
 TIMEOUT = int(os.getenv("TRADINGVIEW_REQUEST_TIMEOUT", "12"))
 
 HEADERS = {
@@ -46,12 +45,6 @@ KNOWN_NYSE_TICKERS = {
 }
 
 KNOWN_AMEX_TICKERS = {"SPY", "QQQ", "DIA", "IWM"}
-
-FALLBACK_TICKERS = [
-    "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "AMZN", "META", "GOOGL",
-    "PLTR", "RIVN", "SMCI", "AVGO", "NFLX", "COIN", "MSTR", "SOFI",
-    "NIO", "BABA", "SHOP", "UBER",
-]
 
 BULLISH_WORDS = [
     "rise", "rises", "rose", "jump", "jumps", "surge", "surges", "gain", "gains",
@@ -119,10 +112,7 @@ def _load_positive_movers(db) -> list[str]:
             candidates.append((ticker, change, rel_volume, volume))
 
     candidates.sort(key=lambda item: (item[1], item[2], item[3]), reverse=True)
-    tickers = [ticker for ticker, _change, _rel_volume, _volume in candidates[:MAX_TICKERS]]
-    if tickers:
-        return tickers
-    return FALLBACK_TICKERS[:MAX_TICKERS]
+    return [ticker for ticker, _change, _rel_volume, _volume in candidates[:MAX_TICKERS]]
 
 
 def _exchange_candidates(ticker: str) -> tuple[str, ...]:
@@ -162,8 +152,6 @@ def _score_title_sentiment(title: str) -> tuple[str, float]:
 
 def _fetch_ticker(ticker: str) -> list[dict]:
     errors = []
-    docs = []
-    seen = set()
     for exchange in _exchange_candidates(ticker):
         symbol = f"{exchange}:{ticker}"
         url = _tradingview_url(symbol)
@@ -175,6 +163,7 @@ def _fetch_ticker(ticker: str) -> list[dict]:
             errors.append(f"{symbol}: {exc}")
             continue
 
+        docs = []
         for item in payload.get("items", [])[:MAX_PER_TICKER]:
             title = _clean(item.get("title", ""))
             if len(title) < 12:
@@ -184,10 +173,6 @@ def _fetch_ticker(ticker: str) -> list[dict]:
             link = item.get("link") or (f"https://www.tradingview.com{story_path}" if story_path else "")
             published = _published_ts(item.get("published"))
             item_id = item.get("id") or link or f"{symbol}:{title}"
-            dedupe_key = str(item_id or link or title)
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
             sentiment, confidence = _score_title_sentiment(title)
             event_type, event_score, event_reason = classify_financial_event(title, provider.get("name", ""))
             docs.append({
@@ -212,11 +197,11 @@ def _fetch_ticker(ticker: str) -> list[dict]:
                 "tradingview_symbol": symbol,
                 "collector": "tradingview_news_mediator_symbol_v1",
             })
+        if docs:
+            return docs
 
-    if not docs:
-        print(f"TradingView {ticker}: SKIP {'; '.join(errors) if errors else 'no items'}")
-    docs.sort(key=lambda doc: int(doc.get("publish_date") or 0), reverse=True)
-    return docs[:MAX_PER_TICKER]
+    print(f"TradingView {ticker}: SKIP {'; '.join(errors) if errors else 'no items'}")
+    return []
 
 
 def _ensure_index(collection, *args, **kwargs) -> None:
@@ -238,17 +223,12 @@ def main() -> None:
 
     tickers = _load_positive_movers(db)
     found = upserted = modified = 0
-    errors = 0
+    kafka_publish_docs = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(_fetch_ticker, ticker) for ticker in tickers]
         for future in as_completed(futures):
-            try:
-                docs = future.result()
-            except Exception as exc:
-                errors += 1
-                print(f"TradingView worker error: {exc}")
-                continue
+            docs = future.result()
             found += len(docs)
             if not docs:
                 continue
@@ -265,36 +245,21 @@ def main() -> None:
             result = articles.bulk_write(ops, ordered=False)
             upserted += result.upserted_count
             modified += result.modified_count
-
-    if errors:
-        record_source_status(
-            db,
-            "TradingView News Flow",
-            "partial_error" if found else "error",
-            detail=f"{found} articles found; {errors} ticker workers failed",
-            count=found,
-            source_type="structured_news",
-        )
-    elif found:
-        record_source_status(
-            db,
-            "TradingView News Flow",
-            "working",
-            detail=f"{len(tickers)} tickers scanned via public news-mediator endpoint",
-            count=found,
-            source_type="structured_news",
-        )
-    else:
-        record_source_status(
-            db,
-            "TradingView News Flow",
-            "no_rows",
-            detail=f"No TradingView news returned across {len(tickers)} tickers",
-            count=0,
-            source_type="structured_news",
-        )
+            kafka_publish_docs.extend(docs)
 
     print(f"TradingView import complete — {found} found, {upserted} new, {modified} updated")
+
+    # --- OPTIONAL Kafka publish (additive; OFF unless KAFKA_PUBLISH_NEWS=true) ---
+    if os.getenv("KAFKA_PUBLISH_NEWS", "false").strip().lower() in ("1", "true", "yes"):
+        try:
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Infrastructure", "kafka"))
+            from news_publisher import publish_articles
+            _sent = publish_articles(kafka_publish_docs)
+            print(f"Kafka publish — {_sent} news events sent to topic")
+        except Exception as exc:
+            print(f"Kafka publish skipped (Mongo import unaffected): {exc}")
+
     client.close()
 
 

@@ -5,7 +5,6 @@ import { clsx } from 'clsx'
 import { StatusBadge } from './StatusBadge'
 import { useToast } from '@/components/shared/Toast'
 import { SentimentModal } from '@/components/shared/SentimentModal'
-import { useTheme } from '@/hooks/useTheme'
 
 const fetcher = (url: string) => fetch(url).then(r => r.json())
 
@@ -14,10 +13,12 @@ const LAST_FETCH_KEY = 'flashfeed:lastFetchAt'
 
 const NAV = [
   { href: '/overview', label: 'Overview' },
+  { href: '/ai', label: 'AI' },
   { href: '/news', label: 'News' },
   { href: '/screener', label: 'Screener' },
   { href: '/social', label: 'Social' },
   { href: '/charts', label: 'Charts' },
+  { href: '/charts-grid', label: 'Charts Grid' },
   { href: '/momentum', label: 'Momentum' },
   { href: '/correlation', label: 'Correlation' },
   { href: '/settings', label: 'Settings' },
@@ -27,19 +28,71 @@ export function TopBar() {
   const { pathname } = useLocation()
   const { toast } = useToast()
   const { mutate } = useSWRConfig()
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const { data: status, mutate: mutateStatus } = useSWR('/api/status', fetcher, { refreshInterval: 30_000 })
-  const { data: newsMeta } = useSWR('/api/articles?limit=1&offset=0&recent_days=1', fetcher, { refreshInterval: 30_000 })
-  const liveArticleCount = Number(newsMeta?.total ?? 0)
   const { data: stats } = useSWR('/api/stats?days=0', fetcher, { refreshInterval: 30_000 })
   const { data: marketStatus } = useSWR('/api/market/status', fetcher, { refreshInterval: 60_000 })
+  // Hard-disk database status (RAM = Redis; this is the on-disk SQLite companion).
+  const { data: diskStats, mutate: mutateDisk } = useSWR('/api/disk/stats', fetcher, { refreshInterval: 30_000 })
+  const [savingDisk, setSavingDisk] = useState(false)
+  const [fetchElapsed, setFetchElapsed] = useState(0)
+  const fetchTimerRef = useRef<number | null>(null)
+
+  // Presence heartbeat: ping while the tab is visible so the server's auto-grabber
+  // knows we're here (and archives to disk only while we're away).
+  useEffect(() => {
+    const ping = () => {
+      if (document.visibilityState === 'visible') {
+        fetch('/api/presence/ping', { method: 'POST' }).catch(() => {})
+      }
+    }
+    ping()
+    const id = window.setInterval(ping, 30_000)
+    document.addEventListener('visibilitychange', ping)
+    return () => { window.clearInterval(id); document.removeEventListener('visibilitychange', ping) }
+  }, [])
+
+  // On exit / tab-hide, save the last 3 days of news to the hard disk via beacon
+  // (reliable during unload). Mirrors the manual "Save 3d → Disk" button.
+  useEffect(() => {
+    const saveOnExit = () => {
+      try { navigator.sendBeacon('/api/disk/save-news?days=3') } catch { /* best effort */ }
+    }
+    const onHide = () => { if (document.visibilityState === 'hidden') saveOnExit() }
+    window.addEventListener('beforeunload', saveOnExit)
+    window.addEventListener('pagehide', saveOnExit)
+    document.addEventListener('visibilitychange', onHide)
+    return () => {
+      window.removeEventListener('beforeunload', saveOnExit)
+      window.removeEventListener('pagehide', saveOnExit)
+      document.removeEventListener('visibilitychange', onHide)
+    }
+  }, [])
+
+  const saveToDisk = async () => {
+    if (savingDisk) return
+    setSavingDisk(true)
+    try {
+      const res = await fetch('/api/disk/save-news?days=3', { method: 'POST' })
+      const data = await res.json()
+      if (data.ok) {
+        toast(`Saved ${data.saved} news items to hard disk`, `Last 3 days · auto-deletes after ${data.retention_days ?? 3} days`, 'success')
+        mutateDisk()
+      } else {
+        toast('Disk save failed', data.error || 'Hard-disk database unavailable', 'error')
+      }
+    } catch {
+      toast('Disk save failed', 'Could not reach API', 'error')
+    } finally {
+      setSavingDisk(false)
+    }
+  }
 
   const [fetching, setFetching] = useState(false)
-  const [fetchResult, setFetchResult] = useState<{ new_articles?: number; updated_articles?: number; refreshed_articles?: number; unchanged_articles?: number; total_articles?: number; ms?: number } | null>(null)
+  const [fetchResult, setFetchResult] = useState<{ new_articles?: number; updated_articles?: number; unchanged_articles?: number; total_articles?: number; ms?: number } | null>(null)
   const [cooldownRemaining, setCooldownRemaining] = useState(0)
   const [watching, setWatching] = useState(false)
   const [watchInterval, setWatchInterval] = useState('60')
-  const [fetchMode, setFetchMode] = useState<'fast' | 'full'>('full')
+  const [fetchMode, setFetchMode] = useState<'fast' | 'full'>('fast')
   const [watchLines, setWatchLines] = useState<Array<{ text: string; type: string; ts: number }>>([])
   const [showSentiment, setShowSentiment] = useState(false)
   const [lastAutoResult, setLastAutoResult] = useState<{ new?: number; updated?: number; ms?: number; at: number } | null>(null)
@@ -87,11 +140,23 @@ export function TopBar() {
 
     setFetching(true)
     setFetchResult(null)
+    setFetchElapsed(0)
     const t0 = Date.now()
+    // Live elapsed counter so the button stays responsive during a long refresh.
+    if (fetchTimerRef.current) window.clearInterval(fetchTimerRef.current)
+    fetchTimerRef.current = window.setInterval(() => setFetchElapsed(Math.floor((Date.now() - t0) / 1000)), 1000)
+    // Safety timeout — a hung request can never lock the button permanently.
+    const ctrl = new AbortController()
+    const timeoutId = window.setTimeout(() => ctrl.abort(), 180_000)
     try {
-      const res = await fetch(`/api/fetch?mode=${fetchMode}`, { method: 'POST' })
+      const res = await fetch(`/api/fetch?mode=${fetchMode}`, { method: 'POST', signal: ctrl.signal })
       const data = await res.json()
       const latency = Date.now() - t0
+      // Backend de-dups overlapping cycles (Run Now + Auto + auto-grab) — surface that.
+      if (data.skipped || data.already_running) {
+        toast('Refresh already running', 'A fetch cycle is already in progress — skipped the duplicate.', 'info')
+        return
+      }
       setFetchResult(data)
       const socialNew = data.social_new ?? 0
       const socialUpdated = data.social_updated ?? 0
@@ -104,10 +169,17 @@ export function TopBar() {
       )
       mutateStatus()
       revalidateDashboardData()
+      mutateDisk()   // Run Now also mirrors news to the hard disk — refresh the disk badge
       setTimeout(() => setFetchResult(null), 8000)
-    } catch {
-      toast('Fetch failed', 'Could not reach API', 'error')
+    } catch (err) {
+      if ((err as any)?.name === 'AbortError') {
+        toast('Fetch timed out', 'The refresh took too long and was cancelled. Try again or use Fast mode.', 'error')
+      } else {
+        toast('Fetch failed', 'Could not reach API', 'error')
+      }
     } finally {
+      window.clearTimeout(timeoutId)
+      if (fetchTimerRef.current) { window.clearInterval(fetchTimerRef.current); fetchTimerRef.current = null }
       setFetching(false)
     }
   }
@@ -207,9 +279,33 @@ export function TopBar() {
             title={cooldownRemaining > 0 ? `Fetch available in ${cooldownRemaining}s` : `${fetchMode === 'fast' ? 'Fast trader refresh' : 'Full source refresh'}`}
             className="px-3 py-1.5 bg-accent text-white text-xs font-medium rounded hover:bg-sky-400 disabled:opacity-50 transition-colors whitespace-nowrap"
           >
-            {fetching ? 'Fetching...' : cooldownRemaining > 0 ? `Fetch ${cooldownRemaining}s` : 'Run Now'}
+            {fetching ? `Fetching ${fetchElapsed}s…` : cooldownRemaining > 0 ? `Fetch ${cooldownRemaining}s` : 'Run Now'}
           </button>
 
+          {/* Save-to-disk — sits right next to Run Now: fetch live, then persist to disk */}
+          <button
+            onClick={saveToDisk}
+            disabled={savingDisk}
+            title="Save the last 3 days of news to the local hard-disk database (auto-deletes after 3 days). Also runs automatically when you exit the site."
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded border border-amber-500/50 text-amber-300 bg-amber-500/10 hover:bg-amber-500/20 hover:border-amber-400 disabled:opacity-50 transition-colors whitespace-nowrap"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+              <polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
+            </svg>
+            {savingDisk ? 'Saving…' : 'Save → Disk'}
+          </button>
+
+          <select
+            value={fetchMode}
+            onChange={e => setFetchMode(e.target.value as 'fast' | 'full')}
+            disabled={fetching || watching}
+            className="hidden md:block bg-bg border border-border text-xs text-neutral rounded px-2 py-1.5 focus:outline-none disabled:opacity-50"
+            title="Fast refresh is optimized for top movers. Full refresh runs every broader source sweep."
+          >
+            <option value="fast">Fast</option>
+            <option value="full">Full</option>
+          </select>
 
           <div className="hidden md:flex items-stretch">
             <select
@@ -240,18 +336,15 @@ export function TopBar() {
             Sentiment
           </button>
 
-
-          <button
-            onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-            className="xl:hidden p-2 rounded border border-border text-neutral hover:text-white hover:border-accent transition-colors"
-            title="Menu"
-          >
-            {mobileMenuOpen ? '✕' : '☰'}
-          </button>
-
           <div className="hidden sm:flex items-center gap-2">
-            {(status || stats || newsMeta) && <StatusBadge ok={status?.ok !== false} label={`${liveArticleCount.toLocaleString()} live articles`} />}
+            {(status || stats) && <StatusBadge ok={status?.ok !== false} label={`${stats?.total_all ?? status?.database?.total_all ?? status?.database?.articles ?? 0} articles`} />}
             {marketStatus && <StatusBadge ok={marketStatus.open} label={marketStatus.label || (marketStatus.open ? 'Market Open' : 'Market Closed')} />}
+            {diskStats?.available && (
+              <StatusBadge
+                ok={true}
+                label={`Disk ${diskStats.total ?? 0} (M${diskStats.by_bucket?.manual ?? 0}/A${diskStats.by_bucket?.auto ?? 0}/F${diskStats.by_bucket?.fetch ?? 0})`}
+              />
+            )}
             {watching && <StatusBadge ok={true} label={`Auto ${watchInterval}s`} />}
             {lastAutoResult && (
               <StatusBadge
@@ -262,28 +355,6 @@ export function TopBar() {
           </div>
         </div>
 
-        {mobileMenuOpen && (
-          <nav className="xl:hidden flex flex-col gap-2 px-4 py-3 border-t border-border bg-surface">
-            {NAV.map(({ href, label }) => {
-              const active = pathname === href || pathname.startsWith(`${href}/`)
-              return (
-                <NavLink
-                  key={href}
-                  to={href}
-                  onClick={() => setMobileMenuOpen(false)}
-                  className={clsx(
-                    'px-3 py-2 text-sm rounded-md border transition-colors',
-                    active
-                      ? 'bg-accent/15 border-accent/50 text-white'
-                      : 'border-border text-neutral hover:text-white'
-                  )}
-                >
-                  {label}
-                </NavLink>
-              )
-            })}
-          </nav>
-        )}
         <nav className="xl:hidden flex items-center gap-1 overflow-x-auto px-4 pb-2">
           {NAV.map(({ href, label }) => {
             const active = pathname === href || pathname.startsWith(`${href}/`)

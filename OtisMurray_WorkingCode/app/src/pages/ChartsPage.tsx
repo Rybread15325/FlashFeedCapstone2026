@@ -1,256 +1,291 @@
 'use client'
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { clsx } from 'clsx'
 import { CandlestickChart } from './CandlestickChart'
 import { RSIChart } from './RSIChart'
 import { MACDChart } from './MACDChart'
-import { SentimentChart } from './SentimentChart'
+import { ResearchChart, type ResearchMode } from './ResearchChart'
+import { TickerEnrichPanels, type EnrichData } from './TickerEnrichPanels'
+import { overlaySeries, type SocialSeries } from '@/lib/chartAgg'
+
+// Full multi-timeframe selector. Each timeframe is fetched from the backend
+// (/api/charts/:ticker?tf=) which returns candles + Bollinger + RSI + MACD already
+// computed for that timeframe — the server picks the right history and resamples
+// the odd buckets (3m/10m/2h/5h/12h/2d). Crosshair/hover is built into the charts.
+const TIMEFRAMES: Array<{ key: string; label: string; min: number }> = [
+  { key: '1m', label: '1m', min: 1 },
+  { key: '3m', label: '3m', min: 3 },
+  { key: '5m', label: '5m', min: 5 },
+  { key: '10m', label: '10m', min: 10 },
+  { key: '15m', label: '15m', min: 15 },
+  { key: '30m', label: '30m', min: 30 },
+  { key: '1h', label: '1h', min: 60 },
+  { key: '2h', label: '2h', min: 120 },
+  { key: '5h', label: '5h', min: 300 },
+  { key: '12h', label: '12h', min: 720 },
+  { key: '1d', label: '1D', min: 1440 },
+  { key: '2d', label: '2D', min: 2880 },
+  { key: '1w', label: '1W', min: 10080 },
+]
+// Density/sentiment overlays are per-minute single-session social, so they only
+// make sense on the single-day intraday timeframes.
+const OVERLAY_TFS = new Set(['1m', '3m'])
+const tfMinutes = (k: string) => TIMEFRAMES.find(t => t.key === k)?.min ?? 5
 
 interface ChartData {
-  candles: Array<{ time: string | number; open: number; high: number; low: number; close: number; volume?: number }>
-  bollinger?: { upper: Array<{ time: string | number; value: number }>; lower: Array<{ time: string | number; value: number }> }
-  rsi?: Array<{ time: string | number; value: number }>
-  macd?: { macd: Array<{ time: string | number; value: number }>; signal: Array<{ time: string | number; value: number }>; histogram: Array<{ time: string | number; value: number }> }
-  predicted?: Array<{ time: string | number; value: number }>
-  news_events?: Array<{ time: string | number; position?: string; color?: string; shape?: string; text?: string; title?: string; source?: string }>
-  prediction_events?: Array<{ time: string | number; title?: string; text?: string; entry_price?: number; label_5m?: { return_pct?: number; direction_correct?: boolean } | null }>
-  sentiment?: Array<{ time: string | number; value: number }>
-  social_density?: Array<{ time: string | number; value: number; scaled?: number; count?: number; session?: string }>
-  source_status?: { price?: string; price_source?: string; price_detail?: string; social?: string; news?: string; predictions?: string | number }
+  date?: string
+  n?: number
+  tf?: string
+  error?: string
+  candles: Array<{ time: number; open: number; high: number; low: number; close: number; volume?: number }>
+  bollinger?: { upper: Array<{ time: number; value: number }>; lower: Array<{ time: number; value: number }> }
+  rsi?: Array<{ time: number; value: number }>
+  macd?: { macd: Array<{ time: number; value: number }>; signal: Array<{ time: number; value: number }>; histogram: Array<{ time: number; value: number }> }
 }
 
-const RANGES = ['1d', '5d', '1mo', '3mo', '6mo', '1y'] as const
-const INTERVALS = ['1m', '5m', '15m', '1h', '1d', '1wk'] as const
-const RANGE_LABELS: Record<string, string> = { '1d': '1 Day', '5d': '5 Days', '1mo': '1 Month', '3mo': '3 Months', '6mo': '6 Months', '1y': '1 Year' }
-const INT_LABELS: Record<string, string> = { '1m': '1 Minute', '5m': '5 Minute', '15m': '15 Minute', '1h': 'Hourly', '1d': 'Daily', '1wk': 'Weekly' }
+// Candlestick + indicators (multi-timeframe) OR the research views (intraday).
+type View = 'candles' | ResearchMode
+const VIEWS: Array<{ key: View; label: string }> = [
+  { key: 'candles', label: 'Candlestick + Indicators' },
+  { key: 'pd',      label: 'Price + Density' },
+  { key: 'sent',    label: 'Sentiment Score' },
+  { key: 'ds',      label: 'Density vs Sentiment' },
+]
+
+// Research views are 1-min intraday only, so they keep the intraday window control.
+type Win = 'full' | '2h' | '1h'
+const WINDOWS: Array<{ key: Win; label: string }> = [
+  { key: 'full', label: 'Full Day' },
+  { key: '2h',   label: 'Last 2h' },
+  { key: '1h',   label: 'Last 1h' },
+]
 
 export function ChartsPage() {
-  const [ticker, setTicker] = useState('AAPL')
-  const [range, setRange] = useState<string>('1d')
-  const [interval, setInterval] = useState<string>('1m')
-  const [rollingWindow, setRollingWindow] = useState(30)
-  const [view, setView] = useState<'simple' | 'advanced'>('simple')
-  const [showSentiment, setShowSentiment] = useState(true)
-  const [showDensity, setShowDensity] = useState(true)
-  const [showBollinger, setShowBollinger] = useState(false)
-  const [showPrediction, setShowPrediction] = useState(false)
+  const [sp, setSp] = useSearchParams()
+  const urlTicker = (sp.get('t') || '').toUpperCase().trim()
+  const [input, setInput] = useState(urlTicker || 'AAPL')
+  const [ticker, setTicker] = useState<string | null>(urlTicker || null)
+  const [view, setView] = useState<View>('candles')
+  const [tf, setTf] = useState('5m')
+  const [win, setWin] = useState<Win>('full')
   const [data, setData] = useState<ChartData | null>(null)
   const [loading, setLoading] = useState(false)
-  const [activeTicker, setActiveTicker] = useState<string | null>(null)
-  const [autoLoaded, setAutoLoaded] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [enrich, setEnrich] = useState<EnrichData | null>(null)
 
-  const loadChart = useCallback(async (windowOverride?: number) => {
-    if (!ticker.trim()) return
-    const windowMinutes = Math.max(1, Math.min(120, Math.round(windowOverride ?? rollingWindow)))
-    setLoading(true)
-    try {
-      const res = await fetch(`/api/charts/${ticker.trim().toUpperCase()}?range=${range}&interval=${interval}&window=${windowMinutes}`)
-      const json = await res.json()
-      setData(json)
-      setActiveTicker(ticker.trim().toUpperCase())
-    } finally {
-      setLoading(false)
-    }
-  }, [ticker, range, interval, rollingWindow])
+  const [showDensity, setShowDensity] = useState(false)
+  const [showSentiment, setShowSentiment] = useState(false)
+  const [social, setSocial] = useState<SocialSeries | null>(null)
+  const [socialMsg, setSocialMsg] = useState('')
+  const socialCache = useRef<Record<string, SocialSeries>>({})
+  const overlayOk = OVERLAY_TFS.has(tf)
+
+  const load = useCallback(() => {
+    const t = input.trim().toUpperCase()
+    if (t) { setTicker(t); setSp({ t }, { replace: true }) }
+  }, [input, setSp])
 
   useEffect(() => {
-    if (!autoLoaded && !data && !loading) {
-      setAutoLoaded(true)
-      loadChart()
+    const t = (sp.get('t') || '').toUpperCase().trim()
+    if (t && t !== ticker) { setInput(t); setTicker(t) }
+  }, [sp])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Per-ticker enrichments (news alert + 3-day news + social/gossip). DB reads.
+  useEffect(() => {
+    if (!ticker) { setEnrich(null); return }
+    let cancelled = false
+    fetch(`/api/ticker/${ticker}/enrich`).then(r => r.json())
+      .then(d => { if (!cancelled) setEnrich(d) })
+      .catch(() => { if (!cancelled) setEnrich(null) })
+    return () => { cancelled = true }
+  }, [ticker])
+
+  // Candlestick view fetches OHLC + indicators for the chosen timeframe from the
+  // backend (the server resamples + computes Bollinger/RSI/MACD per timeframe).
+  useEffect(() => {
+    if (!ticker || view !== 'candles') return
+    let cancelled = false
+    setLoading(true); setError(null)
+    fetch(`/api/charts/${ticker}?tf=${tf}`)
+      .then(r => r.json())
+      .then((json: ChartData) => {
+        if (cancelled) return
+        if (json.error) { setError(json.error); setData(null) }
+        else setData(json)
+      })
+      .catch(() => { if (!cancelled) setError('Failed to load chart data.') })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [ticker, view, tf])
+
+  // Social overlay (density/sentiment) — only on single-day intraday timeframes.
+  const wantOverlay = view === 'candles' && overlayOk && (showDensity || showSentiment)
+  const chartDate = data?.date
+  useEffect(() => {
+    if (!wantOverlay || !ticker || !chartDate) { return }
+    const key = `${ticker}|${chartDate}`
+    if (socialCache.current[key]) { setSocial(socialCache.current[key]); setSocialMsg(''); return }
+    let cancelled = false
+    let timer: number | null = null
+    setSocial(null); setSocialMsg('Loading social data…')
+    const poll = async () => {
+      try {
+        const s = await fetch(`/api/chart/social?${new URLSearchParams({ ticker, date: chartDate })}`).then(r => r.json())
+        if (cancelled) return
+        if (s.error) { setSocialMsg('Social: ' + s.error); return }
+        if (s.status === 'walking') { setSocialMsg(`Loading social history, ${s.count || 0} messages…`); timer = window.setTimeout(poll, 1500); return }
+        if (!s.messages) { setSocialMsg('No social data for this day.'); return }
+        const series: SocialSeries = { labels: s.labels, density: s.density, sent_labels: s.sent_labels, scores_smooth: s.scores_smooth }
+        socialCache.current[key] = series
+        setSocial(series); setSocialMsg(`Social: ${s.source} · ${s.messages} msgs`)
+      } catch { if (!cancelled) setSocialMsg('Social data: error') }
     }
-  }, [autoLoaded, data, loading, loadChart])
+    poll()
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
+  }, [wantOverlay, ticker, chartDate])
+
+  // Build optional overlays from the fetched candles + social (single-day tfs only).
+  const overlays = useMemo(() => {
+    if (!overlayOk || !data?.candles?.length) return { density: undefined, sentiment: undefined }
+    const ov = overlaySeries(data.candles as any, social, tfMinutes(tf), 15)
+    return { density: showDensity ? ov.density : undefined, sentiment: showSentiment ? ov.sentiment : undefined }
+  }, [data, social, showDensity, showSentiment, tf, overlayOk])
+
+  const candleCount = data?.candles?.length ?? 0
 
   return (
     <div>
       {/* Toolbar */}
-      <div className="flex items-center gap-3 mb-4 flex-wrap">
+      <div className="flex items-center gap-3 mb-2 flex-wrap">
         <input
-          value={ticker}
-          onChange={e => setTicker(e.target.value.toUpperCase())}
-          onKeyDown={e => e.key === 'Enter' && loadChart()}
+          value={input}
+          onChange={e => setInput(e.target.value.toUpperCase())}
+          onKeyDown={e => e.key === 'Enter' && load()}
           placeholder="Ticker (e.g. AAPL)"
           className="w-[140px] bg-bg border border-border text-sm text-white rounded px-3 py-2 font-mono focus:outline-none focus:border-accent placeholder:text-slate-600"
         />
-        <select value={range} onChange={e => setRange(e.target.value)}
-          className="bg-bg border border-border text-sm text-neutral rounded px-2 py-2 focus:outline-none focus:border-accent">
-          {RANGES.map(r => <option key={r} value={r}>{RANGE_LABELS[r]}</option>)}
-        </select>
-        <select value={interval} onChange={e => setInterval(e.target.value)}
-          className="bg-bg border border-border text-sm text-neutral rounded px-2 py-2 focus:outline-none focus:border-accent">
-          {INTERVALS.map(i => <option key={i} value={i}>{INT_LABELS[i]}</option>)}
-        </select>
-        <button
-          onClick={() => loadChart()}
-          disabled={loading || !ticker.trim()}
-          className="px-4 py-2 bg-accent text-white text-sm font-medium rounded hover:bg-sky-400 disabled:opacity-50 transition-colors"
-        >
-          {loading ? 'Loading...' : 'Load Chart'}
+        <button onClick={load} disabled={!input.trim()}
+          className="px-4 py-2 bg-accent text-white text-sm font-medium rounded hover:bg-sky-400 disabled:opacity-50 transition-colors">
+          {loading ? 'Loading…' : 'Load Chart'}
         </button>
-        {activeTicker && (
-          <span className="text-accent font-mono font-bold text-lg ml-2">{activeTicker}</span>
+
+        {/* Research-only intraday window selector */}
+        {view !== 'candles' && (
+          <div className="flex items-stretch rounded overflow-hidden border border-border">
+            {WINDOWS.map(w => (
+              <button key={w.key} onClick={() => setWin(w.key)}
+                className={`px-3 py-1.5 text-xs transition-colors ${win === w.key ? 'bg-accent text-white' : 'bg-surface text-neutral hover:text-white'}`}>
+                {w.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {ticker && <span className="text-accent font-mono font-bold text-lg ml-1">{ticker}</span>}
+        {enrich?.news_alert && (
+          <span title={`${enrich.news_alert_count} structured news item(s) in the last 3 days`}
+            className="flex items-center gap-1 text-[11px] font-semibold text-red-400 bg-red-500/10 border border-red-500/40 rounded px-2 py-0.5 animate-pulse">
+            ▲ NEWS {enrich.news_alert_count}
+          </span>
+        )}
+        {data?.date && view === 'candles' && (
+          <span className="text-xs text-neutral">{data.date} · {candleCount} bars · {tf}</span>
         )}
       </div>
 
-      {/* Charts */}
-      {data ? (
-        <div className="space-y-3">
-          <div className="bg-surface border border-border rounded-lg px-3 py-3">
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <div className="flex items-center gap-2">
-                <button onClick={() => setView('simple')} className={view === 'simple' ? 'px-3 py-1.5 rounded bg-sky-500 text-white text-sm font-medium' : 'px-3 py-1.5 rounded bg-bg border border-border text-neutral text-sm'}>Main</button>
-                <button onClick={() => setView('advanced')} className={view === 'advanced' ? 'px-3 py-1.5 rounded bg-sky-500 text-white text-sm font-medium' : 'px-3 py-1.5 rounded bg-bg border border-border text-neutral text-sm'}>Advanced</button>
-              </div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <Toggle label={`Sentiment ${latestOverlayValue(data.sentiment, 'sentiment')}`} active={showSentiment} onClick={() => setShowSentiment(v => !v)} tone="purple" />
-                <Toggle label={`Message Volume ${latestOverlayValue(data.social_density, 'density')}`} active={showDensity} onClick={() => setShowDensity(v => !v)} tone="orange" />
-                <Toggle label="Bollinger" active={showBollinger} onClick={() => setShowBollinger(v => !v)} tone="slate" />
-                <Toggle label="Prediction" active={showPrediction} onClick={() => setShowPrediction(v => !v)} tone="amber" />
-              </div>
-              <div className="flex items-center gap-2 min-w-[280px]">
-                <label className="text-xs uppercase text-neutral whitespace-nowrap">Rolling {rollingWindow >= 60 && rollingWindow % 60 === 0 ? `${rollingWindow / 60}h` : `${rollingWindow}m`}</label>
-                <input
-                  type="range"
-                  min={1}
-                  max={120}
-                  step={1}
-                  value={rollingWindow}
-                  onChange={e => setRollingWindow(Number(e.target.value))}
-                  onMouseUp={() => data && loadChart()}
-                  onTouchEnd={() => data && loadChart()}
-                  className="w-full accent-sky-400"
-                />
-                <button type="button" onClick={() => { setRollingWindow(60); loadChart(60) }} className="px-2 py-1 bg-bg border border-border text-xs text-neutral rounded">1h</button>
-                <button type="button" onClick={() => { setRollingWindow(120); loadChart(120) }} className="px-2 py-1 bg-bg border border-border text-xs text-neutral rounded">2h</button>
-              </div>
-            </div>
-          </div>
+      {/* View selector */}
+      <div className="flex items-center gap-1 mb-3 border-b border-border flex-wrap">
+        {VIEWS.map(v => (
+          <button key={v.key} onClick={() => setView(v.key)}
+            className={`px-3 py-1.5 text-xs transition-colors border-b-2 -mb-px ${
+              view === v.key ? 'text-white border-accent' : 'text-neutral border-transparent hover:text-white'
+            }`}>
+            {v.label}
+          </button>
+        ))}
+        <span className="ml-auto text-[10px] text-neutral pr-1">
+          {view === 'candles' ? 'hover for crosshair · 1m → 1W timeframes' : '1-min intraday · extended hours 04:00–20:00 ET'}
+        </span>
+      </div>
 
-          <ChartCard title={`${activeTicker || ticker} ${RANGE_LABELS[range] ?? range}`} height={view === 'simple' ? 460 : 380}>
-            {data.candles?.length
-              ? <CandlestickChart
-                  candles={data.candles as any}
-                  bollinger={data.bollinger as any}
-                  predicted={data.predicted as any}
-                  newsEvents={data.news_events as any}
-                  density={data.social_density as any}
-                  sentiment={data.sentiment as any}
-                  showSentiment={showSentiment}
-                  showDensity={showDensity}
-                  showBollinger={showBollinger}
-                  showPrediction={showPrediction}
-                  chartStyle={view === 'advanced' ? 'candles' : 'line'}
-                />
-              : <EmptyChart message={data.source_status?.price_detail || 'No price bars returned for this interval.'} />}
-          </ChartCard>
-          {view === 'advanced' && (
-            <>
-              <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-                <Status label="Price" value={data.source_status?.price ?? 'unknown'} />
-                <Status label="Source" value={data.source_status?.price_source ?? 'pending'} />
-                <Status label="Social" value={data.source_status?.social ?? 'pending'} />
-                <Status label="News Markers" value={String(data.news_events?.length ?? 0)} />
-                <Status label="Predictions" value={String(data.prediction_events?.length ?? 0)} />
-                <Status label="Bars" value={String(data.candles?.length ?? 0)} />
-              </div>
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                <ChartCard title="Rolling Message Density" height={150}>
-                  <SentimentChart data={(data.social_density ?? []).map(row => ({ time: row.time as any, value: row.scaled ?? row.value }))} />
-                </ChartCard>
-                <ChartCard title="Rolling Message Sentiment" height={150}>
-                  <SentimentChart data={data.sentiment ?? []} />
-                </ChartCard>
-                <ChartCard title="RSI (14)" height={150}>
-                  <RSIChart data={data.rsi ?? []} />
-                </ChartCard>
-                <ChartCard title="MACD (12,26,9)" height={150}>
-                  <MACDChart data={data.macd} />
-                </ChartCard>
-              </div>
-              <PredictionEvents events={data.prediction_events ?? []} />
-            </>
-          )}
+      {!ticker ? (
+        <div className="text-center py-20 text-neutral">
+          <div className="text-4xl mb-3">📊</div>
+          <div className="text-sm">Enter a ticker symbol and click Load Chart.</div>
         </div>
       ) : (
-        <div className="text-center py-20 text-neutral">
-          <div className="text-sm">Loading the default candle chart...</div>
-        </div>
-      )}
-    </div>
-  )
-}
+        <>
+          {view === 'candles' ? (
+            error ? (
+              <div className="bg-surface border border-border rounded-lg p-8 text-center text-neutral">
+                <div className="text-sm">{error}</div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {/* Full timeframe selector + (single-day) overlays */}
+                <div className="flex items-center gap-3 flex-wrap text-xs">
+                  <div className="flex items-center gap-1">
+                    <span className="text-neutral mr-1">Timeframe</span>
+                    <div className="flex items-stretch rounded overflow-hidden border border-border flex-wrap">
+                      {TIMEFRAMES.map(t => (
+                        <button key={t.key} onClick={() => setTf(t.key)}
+                          className={clsx('px-2.5 py-1 transition-colors border-r border-border last:border-r-0',
+                            tf === t.key ? 'bg-accent text-white' : 'bg-surface text-neutral hover:text-white')}>
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="text-neutral ml-1 tabular-nums">{candleCount} bars</span>
+                  </div>
+                  {overlayOk && (
+                    <>
+                      <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                        <input type="checkbox" checked={showDensity} onChange={e => setShowDensity(e.target.checked)} className="accent-orange-500 cursor-pointer" />
+                        <span style={{ color: '#FF9800' }}>Density</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                        <input type="checkbox" checked={showSentiment} onChange={e => setShowSentiment(e.target.checked)} className="accent-green-500 cursor-pointer" />
+                        <span style={{ color: '#4CAF50' }}>Sentiment</span>
+                      </label>
+                      {(showDensity || showSentiment) && socialMsg && <span className="text-neutral">{socialMsg}</span>}
+                    </>
+                  )}
+                  <span className="ml-auto text-[10px] text-neutral">
+                    {overlayOk ? 'social overlays available on single-day timeframes' : 'switch to 1m / 3m for social overlays'}
+                  </span>
+                </div>
 
-function latestOverlayValue(rows: any[] | undefined, type: 'sentiment' | 'density') {
-  const row = rows?.at(-1)
-  if (!row) return '0'
-  if (type === 'sentiment') return String(Math.round(Math.max(0, Math.min(100, (Number(row.value || 0) + 1) * 50))))
-  const value = Number(row.count ?? row.value ?? 0)
-  return Number.isFinite(value) ? String(Math.round(value)) : '0'
-}
-
-function Toggle({ label, active, onClick, tone }: { label: string; active: boolean; onClick: () => void; tone: 'purple' | 'orange' | 'slate' | 'amber' }) {
-  const activeClasses = {
-    purple: 'border-violet-500 text-violet-300 bg-violet-500/10',
-    orange: 'border-orange-500 text-orange-300 bg-orange-500/10',
-    slate: 'border-slate-500 text-slate-200 bg-slate-500/10',
-    amber: 'border-amber-500 text-amber-300 bg-amber-500/10',
-  }[tone]
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={active
-        ? `px-3 py-1.5 rounded-full border text-sm font-medium ${activeClasses}`
-        : 'px-3 py-1.5 rounded-full border border-border bg-bg text-sm text-neutral'}
-    >
-      {label}
-    </button>
-  )
-}
-
-function eventTime(value: string | number) {
-  const sec = typeof value === 'number' ? value : Math.floor(Date.parse(value) / 1000)
-  if (!Number.isFinite(sec) || sec <= 0) return '--'
-  return new Date(sec * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-}
-
-function PredictionEvents({ events }: { events: NonNullable<ChartData['prediction_events']> }) {
-  if (!events.length) return null
-  return (
-    <div className="bg-surface border border-border rounded-lg overflow-hidden">
-      <div className="px-3 py-2 border-b border-border">
-        <span className="text-xs text-neutral font-medium uppercase">Prediction Signals</span>
-      </div>
-      <div className="divide-y divide-border/60">
-        {events.slice(-5).map((event, index) => {
-          const actual = event.label_5m?.return_pct
-          const correct = event.label_5m?.direction_correct
-          return (
-            <div key={`${event.time}-${index}`} className="grid grid-cols-[86px_1fr_100px] gap-2 px-3 py-2 text-xs items-center">
-              <span className="font-mono text-neutral">{eventTime(event.time)}</span>
-              <span className="text-slate-200 truncate">{event.title || event.text || 'Prediction signal'}</span>
-              <span className={correct === true ? 'text-emerald-400 font-mono text-right' : correct === false ? 'text-orange-400 font-mono text-right' : 'text-neutral font-mono text-right'}>
-                {actual == null ? 'pending' : `${actual > 0 ? '+' : ''}${Number(actual).toFixed(2)}%`}
-              </span>
+                {loading && !data ? (
+                  <div className="text-neutral text-sm animate-pulse p-4">Loading chart…</div>
+                ) : (
+                  <>
+                    <ChartCard title={`Candlestick + Bollinger Bands (20,2) · ${tf}`} height={320}>
+                      {candleCount
+                        ? <CandlestickChart candles={data!.candles as any} bollinger={data!.bollinger as any}
+                            densityOverlay={overlays.density} sentimentOverlay={overlays.sentiment} />
+                        : <div className="h-full flex items-center justify-center text-xs text-neutral">No price bars for this timeframe.</div>}
+                    </ChartCard>
+                    <ChartCard title={`RSI (14) · ${tf}`} height={130}>
+                      <RSIChart data={(data?.rsi ?? []) as any} />
+                    </ChartCard>
+                    <ChartCard title={`MACD (12, 26, 9) · ${tf}`} height={150}>
+                      <MACDChart data={data?.macd as any} />
+                    </ChartCard>
+                  </>
+                )}
+              </div>
+            )
+          ) : (
+            <div className="bg-surface border border-border rounded-lg overflow-hidden" style={{ height: 460 }}>
+              <ResearchChart ticker={ticker} mode={view} window={win} />
             </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
+          )}
 
-function Status({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="bg-surface border border-border rounded-lg px-3 py-2 min-w-0">
-      <div className="font-mono text-sm text-white truncate">{value}</div>
-      <div className="text-[10px] uppercase text-neutral mt-0.5">{label}</div>
-    </div>
-  )
-}
-
-function EmptyChart({ message }: { message: string }) {
-  return (
-    <div className="h-full flex items-center justify-center px-4 text-center text-xs text-neutral">
-      {message}
+          {/* Per-ticker enrichments below the chart: 3-day news + social/gossip */}
+          <TickerEnrichPanels ticker={ticker} enrich={enrich} />
+        </>
+      )}
     </div>
   )
 }

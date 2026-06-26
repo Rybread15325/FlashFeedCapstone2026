@@ -12,7 +12,7 @@ interface Props {
 // Price cache (shared across all rows)
 const priceCache: Record<string, { price: number; change: number; ts: number }> = {}
 
-function formatTime(ts: number | null | undefined): string {
+function formatTime(ts: number | null): string {
   if (!ts) return ''
   const d = new Date(ts * 1000)
   const now = Date.now()
@@ -23,38 +23,11 @@ function formatTime(ts: number | null | undefined): string {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
-function detectionLagLabel(published: number | null | undefined, detected: number | null | undefined): string {
-  if (!published || !detected) return ''
-  const lagSeconds = Math.max(0, Math.floor(detected - published))
-  if (lagSeconds < 60) return 'detected less than 1m after publish'
-  if (lagSeconds < 3600) return `detected ${Math.floor(lagSeconds / 60)}m after publish`
-  if (lagSeconds < 86400) return `detected ${Math.floor(lagSeconds / 3600)}h after publish`
-  return `detected ${Math.floor(lagSeconds / 86400)}d after publish`
-}
-
 function highlightKeywords(text: string, keywords: string[]): React.ReactNode {
-  const cleaned = keywords
-    .map(k => String(k || '').trim())
-    .filter(k => k.length >= 2)
-
-  if (!cleaned.length) return text
-
-  const escapedPatterns = cleaned.map(k => {
-    const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-
-    // Strict matching:
-    // SEC should match "SEC" but not "Security" or "Second".
-    // FDA should match "FDA" but not inside another word.
-    if (/^[A-Za-z0-9]+$/.test(k)) {
-      return `\\b${escaped}\\b`
-    }
-
-    return escaped
-  })
-
-  const regex = new RegExp(`(${escapedPatterns.join('|')})`, 'gi')
+  if (!keywords.length) return text
+  const pattern = keywords.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+  const regex = new RegExp(`(${pattern})`, 'gi')
   const parts = text.split(regex)
-
   return parts.map((part, i) =>
     regex.test(part)
       ? <mark key={i} className="bg-yellow-500/25 text-yellow-200 px-0.5 rounded">{part}</mark>
@@ -93,15 +66,9 @@ export function NewsRow({ article: a, keywords }: Props) {
       rel="noopener noreferrer"
       className="flex items-center gap-2 px-3 py-2 hover:bg-card-hover transition-colors group cursor-pointer border-l-2 border-transparent hover:border-accent"
     >
-      {/* Published / detected timing */}
-      <span
-        className="text-[11px] font-mono text-neutral w-[130px] flex-shrink-0 leading-tight"
-        title={detectionLagLabel(a.publish_date, a.fetched_date)}
-      >
-        <span className="block text-slate-300">Published {formatTime(a.publish_date ?? a.fetched_date)}</span>
-        {a.fetched_date && (
-          <span className="block text-[10px] text-sky-300">Detected {formatTime(a.fetched_date)}</span>
-        )}
+      {/* Time */}
+      <span className="text-[11px] font-mono text-neutral w-[42px] flex-shrink-0">
+        {formatTime(a.publish_date ?? a.fetched_date)}
       </span>
 
       {/* Source badge */}

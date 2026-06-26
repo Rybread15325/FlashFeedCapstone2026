@@ -32,12 +32,7 @@ export interface ScreenerRow {
   social_sentiment?:    number
   social_message_sentiment?: number
   social_message_density?: number
-  stocktwits_message_sentiment?: number
-  stocktwits_message_density?: number
   stocktwits_message_count?: number
-  reddit_message_count?: number
-  bluesky_message_count?: number
-  twitter_message_count?: number
   structured_sentiment?: number
   message_count?:       number
   news_article_count?:  number

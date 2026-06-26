@@ -58,11 +58,9 @@ export function SignalBar({ signal, setSignal, orderBy, setOrderBy, orderDir, se
         />
       </div>
 
-      <button
-        onClick={onRefresh}
-        className="px-2 py-1 text-xs rounded border border-border text-neutral hover:text-white hover:border-accent transition-colors"
-        title="Refresh screener data"
-      >
+      {/* Refresh */}
+      <button onClick={onRefresh}
+        className="px-2 py-1 text-xs bg-bg border border-border text-neutral rounded hover:text-white hover:border-accent transition-colors">
         ↻
       </button>
     </div>

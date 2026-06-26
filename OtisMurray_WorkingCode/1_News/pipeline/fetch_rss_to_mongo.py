@@ -8,7 +8,6 @@ This avoids fake seed data and does not replace Ryan's original PostgreSQL fetch
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import re
 import time
@@ -31,14 +30,12 @@ DB_NAME = os.environ.get("MONGO_DB", "feedflash")
 MARKET_WINDOW_TIMEZONE = os.environ.get("MARKET_WINDOW_TIMEZONE", "America/New_York")
 MARKET_WINDOW_CLOSE_HOUR = int(os.environ.get("MARKET_WINDOW_CLOSE_HOUR_ET", "17"))
 PRUNE_OLD_ARTICLES = os.environ.get("MARKET_WINDOW_PRUNE", "false").lower() in ("1", "true", "yes")
-FILTER_TO_MARKET_WINDOW = os.environ.get("MARKET_WINDOW_FILTER", "true").lower() in ("1", "true", "yes")  # Enabled by default to reduce noise
+FILTER_TO_MARKET_WINDOW = os.environ.get("MARKET_WINDOW_FILTER", "false").lower() in ("1", "true", "yes")
 INCLUDE_CUSTOM_RSS = os.environ.get("INCLUDE_CUSTOM_RSS_SOURCES", "false").lower() in ("1", "true", "yes")
-ENABLE_DEDUP_HASH = os.environ.get("ENABLE_DEDUP_HASH", "false").lower() in ("1", "true", "yes")
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
 APPROVED_STRUCTURED_FEED_NAMES = {
     "PR Newswire",
-    "PR Newswire Financial",
     "ACCESS Newswire",
     "BusinessWire",
     "GlobeNewswire Public Companies",
@@ -54,7 +51,6 @@ APPROVED_STRUCTURED_FEED_NAMES = {
 
 APPROVED_SOURCE_PREFIXES = (
     "PR Newswire",
-    "PR Newswire Financial",
     "ACCESS Newswire",
     "BusinessWire",
     "GlobeNewswire",
@@ -127,49 +123,6 @@ BLOCKED_TICKERS = {
     "EV", "PE", "EPS", "ROI", "API", "IT", "NEW", "FOR", "ARE", "THE",
     "MHRA", "TXM", "ANTHROPIC", "OPENAI", *CRYPTO_TICKERS
 }
-
-ALWAYS_STOCK_NEWS_SOURCES = {
-    "GlobeNewswire Public Companies",
-    "SEC EDGAR Current",
-    "SEC EDGAR 8-K",
-    "SEC EDGAR 10-Q",
-    "SEC EDGAR 10-K",
-}
-
-STOCK_MARKET_TERMS = [
-    "stock", "stocks", "share", "shares", "shareholder", "shareholders",
-    "investor", "investors", "securities", "common stock", "preferred stock",
-    "class action", "lead plaintiff", "nasdaq", "nyse", "amex", "otc",
-    "tsx", "lse", "listed", "listing", "delisting", "ipo", "spac",
-    "earnings", "quarterly results", "annual results", "financial results",
-    "revenue", "profit", "loss", "dividend", "buyback",
-    "repurchase", "merger", "acquisition", "acquires", "acquired",
-    "strategic alternatives", "public offering", "registered direct",
-    "private placement", "warrant", "convertible", "bond offering",
-    "sec filing", "8-k", "10-q", "10-k", "form 4", "s-1",
-]
-
-STOCK_MARKET_RE = re.compile(
-    r"(?<![a-z0-9])(?:" + "|".join(re.escape(term) for term in STOCK_MARKET_TERMS) + r")(?![a-z0-9])",
-    re.IGNORECASE,
-)
-
-EXCHANGE_TICKER_RE = re.compile(r"\b(?:NASDAQ|Nasdaq|NYSE|AMEX|OTC|TSX|LSE)\s*:\s*[A-Z][A-Z0-9.-]{0,5}\b")
-
-
-def _normalize_headline(text: str) -> str:
-    """Normalize headline for deduplication: lowercase, remove punctuation, extra spaces."""
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    text = re.sub(r'\b(the|a|an|is|at|which|on|and|or|but|in|with|for|to|of|as|by)\b', '', text)
-    return text.strip()
-
-
-def _headline_hash(headline: str) -> str:
-    """Create a hash from normalized headline for cross-wire deduplication."""
-    normalized = _normalize_headline(headline)
-    return hashlib.md5(normalized.encode()).hexdigest()
 
 
 def extract_lightweight_tickers(title: str, content: str) -> str:
@@ -377,8 +330,7 @@ def _runtime_rss_feeds():
 
 
 ACCESS_NEWSWIRE_URL = "https://www.accessnewswire.com/newsroom"
-ACCESS_NEWSWIRE_PAGE_SIZE = max(50, min(500, int(os.environ.get("ACCESS_NEWSWIRE_PAGE_SIZE", "250"))))
-ACCESS_NEWSWIRE_API = f"https://www.accessnewswire.com/newsroom/api?pageindex=0&pageSize={ACCESS_NEWSWIRE_PAGE_SIZE}"
+ACCESS_NEWSWIRE_API = "https://www.accessnewswire.com/newsroom/api?pageindex=0&pageSize=50"
 ACCESS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -388,31 +340,6 @@ ACCESS_HEADERS = {
 def _strip_html(value: str) -> str:
     text = re.sub(r"<[^>]+>", " ", value or "")
     return re.sub(r"\s+", " ", text).strip()
-
-
-def is_stock_market_news(article: dict, source_name: str, category: str, ticker: str) -> tuple[bool, str]:
-    """Accept public-company market news without requiring ticker extraction."""
-    title = article.get("title", "")
-    content = article.get("content", "")
-    text = f"{title} {content}"
-
-    if source_name in ALWAYS_STOCK_NEWS_SOURCES:
-        return True, "trusted_stock_feed"
-
-    if category == "filings":
-        return True, "sec_filing"
-
-    if ticker:
-        return True, "ticker_or_company_match"
-
-    if EXCHANGE_TICKER_RE.search(text):
-        return True, "exchange_symbol"
-
-    match = STOCK_MARKET_RE.search(text)
-    if match:
-        return True, f"market_term:{match.group(0).lower()}"
-
-    return False, "not_stock_market_news"
 
 
 def _fetch_access_newswire() -> list[dict]:
@@ -531,13 +458,6 @@ def process_feed(feed):
             article["ticker"] = extract_sec_ticker(title, content, article.get("url", ""))
         if category == "fda" and not article["ticker"]:
             continue
-        is_relevant, relevance_reason = is_stock_market_news(article, name, category, article["ticker"])
-        if not is_relevant:
-            continue
-        article["stock_news_relevance"] = relevance_reason
-        article["stock_news_filter_version"] = "stock_market_relevance_v2"
-        article["suppress_from_main_news"] = False
-        article["main_feed_priority"] = 100 if category == "press_releases" else 85 if category == "fda" else 75
         sentiment, confidence = score_lightweight_sentiment(title, content)
         event_type, event_score, event_reason = classify_financial_event(title, content)
         article["sentiment"] = sentiment
@@ -560,12 +480,9 @@ def process_feed(feed):
         keyword_match = article.get("keyword_match")
         keyword_match_list = [keyword_match] if keyword_match else []
 
-        headline = article.get("title", "")
-        headline_hash = _headline_hash(headline) if ENABLE_DEDUP_HASH and headline else None
-
         docs.append({
             "article_id": article_id,
-            "title": headline,
+            "title": article.get("title", ""),
             "content": article.get("content", ""),
             "url": article_url,
             "source": article.get("source", name),
@@ -582,11 +499,6 @@ def process_feed(feed):
             "event_score": article.get("event_score", 0),
             "sentiment_reason": article.get("sentiment_reason", ""),
             "keyword_match": keyword_match_list,
-            "headline_hash": headline_hash,
-            "stock_news_relevance": article.get("stock_news_relevance", ""),
-            "stock_news_filter_version": article.get("stock_news_filter_version", ""),
-            "suppress_from_main_news": article.get("suppress_from_main_news", False),
-            "main_feed_priority": article.get("main_feed_priority", 50),
         })
 
     return name, url, docs, True, 0
@@ -626,16 +538,6 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         feed_skip = 0
 
         for mongo_doc in docs:
-            # Cross-wire deduplication: if headline_hash already exists from a different source,
-            # skip this article (it's the same story from another wire)
-            headline_hash = mongo_doc.get("headline_hash")
-            if headline_hash and ENABLE_DEDUP_HASH:
-                existing = articles_col.find_one({"headline_hash": headline_hash}, {"_id": 1, "source": 1})
-                if existing and existing.get("_id") != mongo_doc.get("_id"):
-                    # Same story from different source — skip duplicate
-                    feed_skip += 1
-                    continue
-
             # Use URL as the primary upsert key because Mongo has a unique index on url.
             # If the same story comes in with a different generated article_id, matching by
             # article_id causes duplicate-key crashes on url_1.

@@ -202,14 +202,18 @@ router.get('/', async (req, res) => {
 
     const pageSkip = Number(offset || skip || 0)
     const pageLimit = Number(limit || 50)
-    const includeFilings = req.query.include_filings === '1' || req.query.include_filings === 'true'
 
-    const filter = includeFilings ? {} : { suppress_from_main_news: { $ne: true } }
+    const filter = {}
     const tickerFilters = []
     let moverTickers = []
 
     if (sentiment) filter.sentiment = sentiment
     if (source) filter.source = source
+
+    // Hide SEC EDGAR filings from the UI unless explicitly requested
+    const includeSec = req.query.include_sec === '1' || req.query.include_sec === 'true'
+    if (!includeSec) filter.category = { $ne: 'filings' }
+
     if (ticker) tickerFilters.push({ ticker: { $regex: tickerCsvRegex([ticker]) } })
     if (ticker_only === '1' || ticker_only === 'true') {
       tickerFilters.push({ ticker: { $exists: true, $nin: ['', null] } })
@@ -233,13 +237,7 @@ router.get('/', async (req, res) => {
 
     const [articles, total] = await Promise.all([
       Article.collection.find(filter)
-        .sort({
-          main_feed_priority: -1,
-          feed_sort_time: -1,
-          publish_date: -1,
-          fetched_date: -1,
-          detected_at: -1
-        })
+        .sort({ publish_date: -1, fetched_date: -1 })
         .skip(pageSkip)
         .limit(pageLimit)
         .toArray(),

@@ -1,4 +1,7 @@
 import { useEffect, useState } from 'react'
+import { getCustomStocks, addCustomStock, removeCustomStock, normalizeTicker } from '../lib/stocks'
+import { DiskDbPanel } from '../components/shared/DiskDbPanel'
+import { RamDbPanel } from '../components/shared/RamDbPanel'
 
 type KeywordRow = {
   keyword: string
@@ -23,7 +26,6 @@ type SourceRow = {
   configured?: boolean
   latest_fetch?: number | string | null
   detail?: string
-  collection?: string
 }
 
 type ConnectionRow = {
@@ -49,6 +51,7 @@ export function SettingsPage() {
   const [keywords, setKeywords] = useState<KeywordRow[]>([])
   const [structured, setStructured] = useState<SourceRow[]>([])
   const [customSources, setCustomSources] = useState<SourceRow[]>([])
+  const [favorites, setFavorites] = useState<Set<string>>(new Set())
   const [sourceHealth, setSourceHealth] = useState<{ working_count?: number; ready_count?: number; blocked_count?: number; planned_count?: number; sources?: SourceRow[] }>({})
   const [connections, setConnections] = useState<ConnectionSettings>({})
   const [newKeyword, setNewKeyword] = useState('')
@@ -58,26 +61,24 @@ export function SettingsPage() {
   const [newSourceCategory, setNewSourceCategory] = useState('custom')
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState<string | null>(null)
-  const [loadingHealth, setLoadingHealth] = useState(false)
+  const [customStocks, setCustomStocks] = useState<string[]>(() => getCustomStocks())
+  const [newStock, setNewStock] = useState('')
+  const [favFilter, setFavFilter] = useState(false)
 
   const load = async () => {
     setError(null)
-    setLoadingHealth(true)
-    try {
-      const [kw, src, conn, health] = await Promise.all([
-        jsonFetch('/api/settings/keywords'),
-        jsonFetch('/api/settings/sources'),
-        jsonFetch('/api/settings/connections'),
-        jsonFetch('/api/sources/health').catch(() => ({ sources: [] })),
-      ])
-      setKeywords(kw.keywords || [])
-      setStructured(src.structured || [])
-      setCustomSources(src.custom_rss_sources || [])
-      setConnections(conn.connections || {})
-      setSourceHealth(health || {})
-    } finally {
-      setLoadingHealth(false)
-    }
+    const [kw, src, conn, health] = await Promise.all([
+      jsonFetch('/api/settings/keywords'),
+      jsonFetch('/api/settings/sources'),
+      jsonFetch('/api/settings/connections'),
+      jsonFetch('/api/sources/health').catch(() => ({ sources: [] })),
+    ])
+    setKeywords(kw.keywords || [])
+    setStructured(src.structured || [])
+    setCustomSources(src.custom_rss_sources || [])
+    setFavorites(new Set(src.favorites || []))
+    setConnections(conn.connections || {})
+    setSourceHealth(health || {})
   }
 
   useEffect(() => {
@@ -139,6 +140,18 @@ export function SettingsPage() {
     await load()
   }
 
+  const toggleFavorite = async (name: string) => {
+    const isFav = favorites.has(name)
+    setFavorites(prev => {
+      const next = new Set(prev)
+      isFav ? next.delete(name) : next.add(name)
+      return next
+    })
+    await jsonFetch(`/api/settings/sources/${encodeURIComponent(name)}/favorite`, {
+      method: isFav ? 'DELETE' : 'POST',
+    }).catch(() => {})
+  }
+
   const setConnectionField = (key: string, field: keyof ConnectionRow, value: string) => {
     setConnections(prev => ({
       ...prev,
@@ -189,8 +202,47 @@ export function SettingsPage() {
         </p>
       </div>
 
+      <RamDbPanel />
+      <DiskDbPanel />
+
       {error && <div className="border border-red-500/40 bg-red-500/10 text-red-300 rounded-lg p-3 text-sm">{error}</div>}
       {saved && <div className="border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 rounded-lg p-3 text-sm">{saved}</div>}
+
+      <section className="bg-surface border border-border rounded-lg p-4">
+        <div className="mb-3">
+          <h2 className="text-white font-medium">Custom Stocks</h2>
+          <p className="text-xs text-neutral mt-1">Add your own tickers — they appear at the top of the Charts ticker dropdown. Saved in this browser.</p>
+        </div>
+        <div className="flex items-center gap-2 mb-3">
+          <input
+            value={newStock}
+            onChange={e => setNewStock(normalizeTicker(e.target.value))}
+            onKeyDown={e => { if (e.key === 'Enter' && normalizeTicker(newStock)) { setCustomStocks(addCustomStock(newStock)); setNewStock(''); setSaved('Custom stock added — it now appears in the Charts dropdown'); setError(null) } }}
+            placeholder="Add ticker (e.g. SHOP)"
+            className="w-[180px] bg-bg border border-border text-sm text-white rounded px-3 py-2 font-mono focus:outline-none focus:border-accent placeholder:text-slate-600"
+          />
+          <button
+            onClick={() => { if (normalizeTicker(newStock)) { setCustomStocks(addCustomStock(newStock)); setNewStock(''); setSaved('Custom stock added — it now appears in the Charts dropdown'); setError(null) } }}
+            className="px-4 py-2 bg-accent text-white text-sm font-medium rounded hover:bg-sky-400 transition-colors"
+          >Add</button>
+        </div>
+        {customStocks.length === 0 ? (
+          <p className="text-sm text-neutral">No custom stocks yet.</p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {customStocks.map(sym => (
+              <span key={sym} className="inline-flex items-center gap-2 bg-bg border border-border rounded-full pl-3 pr-2 py-1 text-sm font-mono text-accent">
+                {sym}
+                <button
+                  onClick={() => { setCustomStocks(removeCustomStock(sym)); setSaved('Custom stock removed'); setError(null) }}
+                  className="text-neutral hover:text-red-400 leading-none text-base"
+                  title={`Remove ${sym}`}
+                >×</button>
+              </span>
+            ))}
+          </div>
+        )}
+      </section>
 
       <section className="bg-surface border border-border rounded-lg p-4">
         <div className="flex items-center justify-between gap-3 mb-3">
@@ -204,12 +256,6 @@ export function SettingsPage() {
             <HealthMetric label="Blocked" value={sourceHealth.blocked_count ?? 0} tone="text-yellow-300" />
             <HealthMetric label="Planned" value={sourceHealth.planned_count ?? 0} tone="text-neutral" />
           </div>
-          <button
-            onClick={() => load().catch(e => setError(String(e.message || e)))}
-            className="border border-border text-neutral hover:text-white hover:border-accent rounded px-3 py-2 text-xs"
-          >
-            {loadingHealth ? 'Refreshing...' : 'Refresh'}
-          </button>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -217,14 +263,12 @@ export function SettingsPage() {
               <tr className="text-left text-neutral border-b border-border">
                 <th className="py-2 pr-3">Source</th>
                 <th className="py-2 pr-3">Status</th>
-                <th className="py-2 pr-3">Type</th>
                 <th className="py-2 pr-3 text-right">Rows</th>
                 <th className="py-2 pr-3">Last Seen</th>
-                <th className="py-2 pr-3">Detail</th>
               </tr>
             </thead>
             <tbody>
-              {(sourceHealth.sources || []).map(s => (
+              {(sourceHealth.sources || []).slice(0, 12).map(s => (
                 <tr key={s.source || s.name} className="border-b border-border/50">
                   <td className="py-2 pr-3 text-white">{s.source || s.name}</td>
                   <td className="py-2 pr-3">
@@ -232,17 +276,13 @@ export function SettingsPage() {
                       {s.status || 'unknown'}
                     </span>
                   </td>
-                  <td className="py-2 pr-3 text-neutral">{s.collection || s.category || '--'}</td>
                   <td className="py-2 pr-3 text-right font-mono text-neutral">{s.count ?? 0}</td>
                   <td className="py-2 pr-3 text-neutral">{timeAgo(s.latest_fetch)}</td>
-                  <td className="py-2 pr-3 text-neutral max-w-[280px] truncate" title={s.detail || s.note || s.method || ''}>
-                    {s.detail || s.note || s.method || '--'}
-                  </td>
                 </tr>
               ))}
               {!(sourceHealth.sources || []).length && (
                 <tr>
-                  <td colSpan={6} className="py-4 text-center text-neutral">Source health has not loaded yet.</td>
+                  <td colSpan={4} className="py-4 text-center text-neutral">Source health has not loaded yet.</td>
                 </tr>
               )}
             </tbody>
@@ -355,10 +395,38 @@ export function SettingsPage() {
         </div>
       </section>
 
+      {/* Favorites quick-view */}
+      {favorites.size > 0 && (
+        <section className="bg-surface border border-amber-500/30 rounded-lg p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h2 className="text-white font-medium flex items-center gap-2">
+                <span className="text-amber-400">★</span> Favorited Sources
+              </h2>
+              <p className="text-xs text-neutral mt-0.5">{favorites.size} saved · shown first in news filtering</p>
+            </div>
+            <button
+              onClick={() => setFavFilter(f => !f)}
+              className={`text-xs px-3 py-1.5 rounded border transition-colors ${favFilter ? 'bg-amber-500/20 border-amber-400 text-amber-300' : 'border-border text-neutral hover:text-white'}`}
+            >
+              {favFilter ? '★ Favorites only' : 'Show all'}
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {Array.from(favorites).map(name => (
+              <span key={name} className="inline-flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-300 rounded-full pl-3 pr-2 py-1 text-xs font-medium">
+                {name}
+                <button onClick={() => toggleFavorite(name)} className="hover:text-red-400 text-base leading-none" title="Remove from favorites">×</button>
+              </span>
+            ))}
+          </div>
+        </section>
+      )}
+
       <section className="bg-surface border border-border rounded-lg p-4">
         <div className="mb-3">
           <h2 className="text-white font-medium">Add Custom RSS Source</h2>
-          <p className="text-xs text-neutral">These are read by the RSS importer on the next fetch run.</p>
+          <p className="text-xs text-neutral">These are read by the RSS importer on the next fetch run. Star a source to favorite it.</p>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-[180px_1fr_150px_auto] gap-2 mb-4">
@@ -392,27 +460,36 @@ export function SettingsPage() {
         <div className="space-y-2">
           {customSources.length === 0 ? (
             <div className="text-sm text-neutral border border-border rounded p-3">No custom RSS sources yet.</div>
-          ) : customSources.map(s => {
+          ) : [...customSources]
+              .sort((a, b) => {
+                const aFav = favorites.has(a.name || a.source || '')
+                const bFav = favorites.has(b.name || b.source || '')
+                return aFav === bFav ? 0 : aFav ? -1 : 1
+              })
+              .filter(s => !favFilter || favorites.has(s.name || s.source || ''))
+              .map(s => {
             const name = s.name || s.source || ''
             const enabled = s.enabled !== false
+            const isFav = favorites.has(name)
             return (
-              <div key={name} className="flex items-center justify-between gap-3 border border-border rounded p-3 bg-bg/40">
-                <div className="min-w-0">
+              <div key={name} className={`flex items-center justify-between gap-3 border rounded p-3 bg-bg/40 ${isFav ? 'border-amber-500/40' : 'border-border'}`}>
+                <button
+                  onClick={() => toggleFavorite(name)}
+                  title={isFav ? 'Remove from favorites' : 'Add to favorites'}
+                  className={`text-xl leading-none flex-shrink-0 transition-colors ${isFav ? 'text-amber-400' : 'text-neutral hover:text-amber-400'}`}
+                >
+                  {isFav ? '★' : '☆'}
+                </button>
+                <div className="min-w-0 flex-1">
                   <div className="text-sm text-white">{name}</div>
                   <div className="text-xs text-neutral truncate">{s.url}</div>
                   <div className="text-[11px] text-neutral">{s.category || 'custom'} · {enabled ? 'enabled' : 'disabled'}</div>
                 </div>
                 <div className="flex gap-1">
-                  <button
-                    onClick={() => toggleSource(name, !enabled)}
-                    className="text-xs border border-border text-neutral rounded px-2 py-1 hover:text-white"
-                  >
+                  <button onClick={() => toggleSource(name, !enabled)} className="text-xs border border-border text-neutral rounded px-2 py-1 hover:text-white">
                     {enabled ? 'Disable' : 'Enable'}
                   </button>
-                  <button
-                    onClick={() => removeSource(name)}
-                    className="text-xs border border-red-500/40 text-red-300 rounded px-2 py-1 hover:text-red-200"
-                  >
+                  <button onClick={() => removeSource(name)} className="text-xs border border-red-500/40 text-red-300 rounded px-2 py-1 hover:text-red-200">
                     Remove
                   </button>
                 </div>
@@ -423,15 +500,19 @@ export function SettingsPage() {
       </section>
 
       <section className="bg-surface border border-border rounded-lg p-4">
-        <div className="mb-3">
-          <h2 className="text-white font-medium">Professor Structured Sources</h2>
-          <p className="text-xs text-neutral">Working sources show article counts. Licensed/API-gated sources stay visible instead of being hidden.</p>
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h2 className="text-white font-medium">Professor Structured Sources</h2>
+            <p className="text-xs text-neutral">Working sources show article counts. Star to favorite. Licensed sources stay visible.</p>
+          </div>
+          <span className="text-xs text-neutral">{favorites.size > 0 ? `${favorites.size} starred` : 'none starred'}</span>
         </div>
 
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-neutral border-b border-border">
+                <th className="py-2 pr-2 w-6"></th>
                 <th className="py-2 pr-3">Source</th>
                 <th className="py-2 pr-3">Status</th>
                 <th className="py-2 pr-3">Method</th>
@@ -439,18 +520,36 @@ export function SettingsPage() {
               </tr>
             </thead>
             <tbody>
-              {structured.map(s => (
-                <tr key={s.source || s.name} className="border-b border-border/50">
-                  <td className="py-2 pr-3 text-white">{s.source || s.name}</td>
-                  <td className="py-2 pr-3">
-                    <span className={`inline-flex border rounded-full px-2 py-0.5 text-xs ${statusClass(s.status)}`}>
-                      {s.status}
-                    </span>
-                  </td>
-                  <td className="py-2 pr-3 text-neutral">{s.method}</td>
-                  <td className="py-2 pr-3 text-right font-mono text-neutral">{s.count ?? 0}</td>
-                </tr>
-              ))}
+              {[...structured]
+                .sort((a, b) => {
+                  const aFav = favorites.has(a.source || a.name || '')
+                  const bFav = favorites.has(b.source || b.name || '')
+                  return aFav === bFav ? 0 : aFav ? -1 : 1
+                })
+                .filter(s => !favFilter || favorites.has(s.source || s.name || ''))
+                .map(s => {
+                const key = s.source || s.name || ''
+                const isFav = favorites.has(key)
+                return (
+                  <tr key={key} className={`border-b border-border/50 ${isFav ? 'bg-amber-500/5' : ''}`}>
+                    <td className="py-2 pr-2">
+                      <button
+                        onClick={() => toggleFavorite(key)}
+                        title={isFav ? 'Remove from favorites' : 'Add to favorites'}
+                        className={`text-base leading-none transition-colors ${isFav ? 'text-amber-400' : 'text-neutral hover:text-amber-400'}`}
+                      >
+                        {isFav ? '★' : '☆'}
+                      </button>
+                    </td>
+                    <td className="py-2 pr-3 text-white font-medium">{key}</td>
+                    <td className="py-2 pr-3">
+                      <span className={`inline-flex border rounded-full px-2 py-0.5 text-xs ${statusClass(s.status)}`}>{s.status}</span>
+                    </td>
+                    <td className="py-2 pr-3 text-neutral">{s.method}</td>
+                    <td className="py-2 pr-3 text-right font-mono text-neutral">{s.count ?? 0}</td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>

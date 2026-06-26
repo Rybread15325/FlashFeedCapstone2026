@@ -1,9 +1,6 @@
 import { ScreenerRow } from './ScreenerRow'
 import type { ScreenerRow as SR } from '@/lib/types'
 import type { ViewMode } from './ScreenerPage'
-import { downloadCSV } from '@/hooks/useCSVExport'
-import { TableSkeleton } from '@/components/shared/Skeleton'
-import { useVirtualScroll } from '@/hooks/useVirtualScroll'
 
 interface Props { rows: SR[]; isLoading: boolean; viewMode: ViewMode }
 
@@ -50,51 +47,20 @@ const COLUMNS: Record<ViewMode, Array<{ key: string; label: string }>> = {
 
 export function ScreenerTable({ rows, isLoading, viewMode }: Props) {
   const columns = COLUMNS[viewMode]
-  const ROW_HEIGHT = 44
-  const CONTAINER_HEIGHT = 600
 
-  const { visibleItems, totalHeight, handleScroll } = useVirtualScroll(rows, {
-    itemHeight: ROW_HEIGHT,
-    containerHeight: CONTAINER_HEIGHT,
-    overscan: 10,
-  })
-
-  if (isLoading) return <TableSkeleton rows={8} cols={columns.length} />
+  if (isLoading) return <div className="text-neutral text-sm animate-pulse p-4">Loading screener data...</div>
   if (rows.length === 0) return (
     <div className="text-center py-12 text-neutral">
       <div className="text-3xl mb-2">🔍</div>
       <div className="text-sm">No tickers match current filters</div>
-      <div className="text-xs text-neutral/60 mt-2">Try adjusting filters or click "Run Now" to fetch fresh data</div>
     </div>
   )
 
-  const handleExport = () => {
-    const exportData = rows.map(row => {
-      const obj: Record<string, unknown> = {}
-      columns.forEach(col => {
-        obj[col.label] = row[col.key as keyof SR]
-      })
-      return obj
-    })
-    downloadCSV(exportData, `screener_${viewMode}`)
-  }
-
   return (
     <div className="bg-surface border border-border rounded-lg overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <span className="text-xs text-neutral">{rows.length} results</span>
-        <button
-          onClick={handleExport}
-          disabled={rows.length === 0}
-          className="px-2 py-1 text-xs rounded border border-border text-neutral hover:text-white hover:border-accent disabled:opacity-50 transition-colors"
-          title="Export to CSV"
-        >
-          📥 Export CSV
-        </button>
-      </div>
       <div className="overflow-x-auto">
-        <table className="w-full text-xs" style={{ height: CONTAINER_HEIGHT }}>
-          <thead className="border-b border-border bg-bg/50 sticky top-0 z-10">
+        <table className="w-full text-xs">
+          <thead className="border-b border-border bg-bg/50">
             <tr>
               {columns.map(col => (
                 <th key={col.key} className="px-2 py-2 text-left text-[10px] text-neutral uppercase tracking-wide font-medium whitespace-nowrap">
@@ -103,12 +69,8 @@ export function ScreenerTable({ rows, isLoading, viewMode }: Props) {
               ))}
             </tr>
           </thead>
-          <tbody className="relative" style={{ height: totalHeight }} onScroll={handleScroll}>
-            {visibleItems.map(({ item: row, index, offsetTop }) => (
-              <tr key={row.ticker} className="absolute w-full divide-y divide-slate-700/30" style={{ top: offsetTop, height: ROW_HEIGHT }}>
-                <ScreenerRow row={row} columns={columns} />
-              </tr>
-            ))}
+          <tbody className="divide-y divide-slate-700/30">
+            {rows.map(row => <ScreenerRow key={row.ticker} row={row} columns={columns} />)}
           </tbody>
         </table>
       </div>

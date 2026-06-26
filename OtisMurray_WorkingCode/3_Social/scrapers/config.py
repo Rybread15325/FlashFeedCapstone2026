@@ -107,6 +107,29 @@ REDIS_URL: str = os.getenv("REDIS_URL", "")
 # ---------------------------------------------------------------------------
 POSTGRES_DSN: str = os.getenv("POSTGRES_DSN", "")
 
-# Reddit disabled — old.reddit.com JSON API deprecated in 2023
-# To re-enable, use PRAW (Python Reddit API Wrapper) with OAuth credentials
-SUBREDDITS: list[str] = []
+SUBREDDITS: list[str] = [
+    "wallstreetbets",
+    "wallstreetbets2",
+    "wallstreetbets_wins",
+    "wallstreetbetsELITE",
+    "wallstreetbetsnew",
+    "wallstreetelite",
+    "wallstreetsmallcap",
+    "smallstreetbets",
+    "thewallstreet",
+    "pennystocks",
+    "pennystock",
+    "10xpennystocks",
+    "stockmarket",
+    "stocks",
+    "stocks_picks",
+    "stocksandtrading",
+    "stockstobuytoday",
+    "stocktradingalerts",
+    "swingtrading",
+    "trading",
+    "trakstocks",
+    "shortsqueeze",
+    "stockaday",
+    "options",
+]
