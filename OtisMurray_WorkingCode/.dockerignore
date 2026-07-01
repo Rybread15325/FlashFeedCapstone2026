@@ -1,7 +1,0 @@
-.git
-.env
-.venv
-**/node_modules
-app_broken_vite_backup_*
-*.log
-.DS_Store
