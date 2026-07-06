@@ -1,4 +1,4 @@
-# FeedFlash — Real-Time Finance Research Dashboard
+# FlashFeed — Real-Time Finance Research Dashboard
 
 A self-hosted finance dashboard that aggregates news, social sentiment, and market data into one live interface. Runs entirely in Docker — no local Node.js or Python required.
 
